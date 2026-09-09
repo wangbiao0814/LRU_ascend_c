@@ -49,14 +49,19 @@ def make_inputs(batch_size, k, hit_rate, seed):
     return torch.stack(lru_rows), torch.stack(hit_rows), hit_count
 
 
-def build_lru_plan_reference(lru, hit):
+def build_lru_plan_reference(lru, hit, hit_mask):
     output_lru = []
     output_hit = []
-    for lru_row, hit_row in zip(lru.tolist(), hit.tolist()):
-        hit_set = {value for value in hit_row if value != -1}
+    for lru_row, hit_row, mask_row in zip(
+        lru.tolist(), hit.tolist(), hit_mask.tolist()
+    ):
+        hit_set = {value for value, is_hit in zip(hit_row, mask_row) if is_hit}
         miss_values = [value for value in reversed(lru_row) if value not in hit_set]
         miss_iter = iter(miss_values)
-        filled = [value if value != -1 else next(miss_iter) for value in hit_row]
+        filled = [
+            value if is_hit else next(miss_iter)
+            for value, is_hit in zip(hit_row, mask_row)
+        ]
         selected = set(filled)
         remaining = [value for value in lru_row if value not in selected]
         output_hit.append(filled)
@@ -82,29 +87,51 @@ def benchmark(args):
     lru_cpu, hit_cpu, hit_count = make_inputs(
         args.batch_size, args.k, args.hit_rate, args.seed
     )
-    expected_lru, expected_hit = build_lru_plan_reference(lru_cpu, hit_cpu)
+    hit_mask_cpu = hit_cpu.ne(-1)
+    expected_lru, expected_hit = build_lru_plan_reference(
+        lru_cpu, hit_cpu, hit_mask_cpu
+    )
     lru = lru_cpu.to(device)
-    hit = hit_cpu.to(device)
+    hit_mask = hit_mask_cpu.to(device)
+    correctness_hit = hit_cpu.to(device)
 
-    actual_lru, actual_hit = torch.ops.npu.build_lru_plan(lru, hit)
+    actual_lru = torch.ops.npu.build_lru_plan(
+        lru, correctness_hit, hit_mask
+    )
     torch.npu.synchronize()
     torch.testing.assert_close(actual_lru.cpu(), expected_lru, rtol=0, atol=0)
-    torch.testing.assert_close(actual_hit.cpu(), expected_hit, rtol=0, atol=0)
+    torch.testing.assert_close(correctness_hit.cpu(), expected_hit, rtol=0, atol=0)
+
+    total_calls = args.warmup + args.iterations + args.latency_samples
+    hit_pool = (
+        hit_cpu.unsqueeze(0)
+        .expand(total_calls, -1, -1)
+        .clone()
+        .to(device)
+    )
+    call_index = 0
 
     for _ in range(args.warmup):
-        torch.ops.npu.build_lru_plan(lru, hit)
+        torch.ops.npu.build_lru_plan(lru, hit_pool[call_index], hit_mask)
+        call_index += 1
     torch.npu.synchronize()
 
     start = time.perf_counter()
     for _ in range(args.iterations):
-        actual_lru, actual_hit = torch.ops.npu.build_lru_plan(lru, hit)
+        actual_lru = torch.ops.npu.build_lru_plan(
+            lru, hit_pool[call_index], hit_mask
+        )
+        call_index += 1
     torch.npu.synchronize()
     total_seconds = time.perf_counter() - start
 
     synchronized_samples_ms = []
     for _ in range(args.latency_samples):
         sample_start = time.perf_counter()
-        actual_lru, actual_hit = torch.ops.npu.build_lru_plan(lru, hit)
+        actual_lru = torch.ops.npu.build_lru_plan(
+            lru, hit_pool[call_index], hit_mask
+        )
+        call_index += 1
         torch.npu.synchronize()
         synchronized_samples_ms.append((time.perf_counter() - sample_start) * 1000.0)
 

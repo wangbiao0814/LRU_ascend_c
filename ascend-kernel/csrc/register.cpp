@@ -20,7 +20,7 @@ namespace {
 TORCH_LIBRARY_FRAGMENT(npu, m)
 {
     m.def("helloworld(Tensor x, Tensor y) -> Tensor");
-    m.def("build_lru_plan(Tensor lru, Tensor hit) -> (Tensor new_lru, Tensor hit_and_miss)");
+    m.def("build_lru_plan(Tensor lru, Tensor(a!) hit, Tensor hit_mask) -> Tensor new_lru");
     m.def("avg_pool3d(Tensor self, int[3] kernel_size, int[3] stride=[], int[3] padding=0, bool ceil_mode=False, bool count_include_pad=True, int? divisor_override=None) -> Tensor");
 
 #ifdef BUILD_CATLASS_MODULE

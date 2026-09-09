@@ -13,7 +13,8 @@
 #include <algorithm>
 #include <cstdint>
 #include <limits>
-#include <tuple>
+
+#include <ATen/MemoryOverlap.h>
 
 #include "torch_kernel_helper.h"
 #include "tiling/platform/platform_ascendc.h"
@@ -63,33 +64,74 @@ int64_t MaximumKernelUbBytes(int64_t lruStride, int64_t hitTileLength,
                              int64_t lruTileLength, int64_t hitMetaStride,
                              int64_t lruMetaStride, int64_t valueStride)
 {
-    // materialize: row bitmap + three tile buffers + compact hit/candidate
-    // metadata + all candidate values + one aligned scalar block.
-    int64_t maxTileLength = std::max(hitTileLength, lruTileLength);
-    int64_t elements = lruStride + 3 * maxTileLength + hitMetaStride +
-                       lruMetaStride + valueStride + kInt32PerDataBlock;
-    return elements * static_cast<int64_t>(sizeof(int32_t));
+    int64_t scalarBlockBytes = kInt32PerDataBlock *
+                               static_cast<int64_t>(sizeof(int32_t));
+    int64_t metadataBytes = (hitMetaStride + lruMetaStride) *
+                            static_cast<int64_t>(sizeof(int32_t));
+    int64_t maskTileBytes = AlignUp(hitTileLength, 32);
+
+    int64_t hitLocalBytes = lruStride * static_cast<int64_t>(sizeof(float)) +
+                            hitTileLength * static_cast<int64_t>(sizeof(int32_t)) +
+                            scalarBlockBytes;
+    int64_t candidateLocalBytes = lruStride * static_cast<int64_t>(sizeof(float)) +
+                                  2 * lruTileLength *
+                                      static_cast<int64_t>(sizeof(int32_t)) +
+                                  scalarBlockBytes;
+    int64_t materializeHitBytes = valueStride *
+                                      static_cast<int64_t>(sizeof(int32_t)) +
+                                  metadataBytes +
+                                  2 * hitTileLength *
+                                      static_cast<int64_t>(sizeof(int32_t)) +
+                                  maskTileBytes + scalarBlockBytes;
+    int64_t materializeLruBytes = lruStride *
+                                      static_cast<int64_t>(sizeof(float)) +
+                                  metadataBytes +
+                                  2 * lruTileLength *
+                                      static_cast<int64_t>(sizeof(int32_t)) +
+                                  scalarBlockBytes;
+    int64_t keepWriteBytes = lruMetaStride *
+                                 static_cast<int64_t>(sizeof(int32_t)) +
+                             lruTileLength *
+                                 static_cast<int64_t>(sizeof(int32_t));
+
+    return std::max(
+        std::max(hitLocalBytes, candidateLocalBytes),
+        std::max(std::max(materializeHitBytes, materializeLruBytes),
+                 keepWriteBytes));
 }
 
 }  // namespace
 
-std::tuple<at::Tensor, at::Tensor> build_lru_plan(
-    const at::Tensor &lru, const at::Tensor &hit)
+at::Tensor build_lru_plan(const at::Tensor &lru, at::Tensor &hit,
+                          const at::Tensor &hitMask)
 {
     TORCH_CHECK(lru.device().type() == at::DeviceType::PrivateUse1,
                 "build_lru_plan: lru must be on an NPU device");
     TORCH_CHECK(hit.device().type() == at::DeviceType::PrivateUse1,
                 "build_lru_plan: hit must be on an NPU device");
-    TORCH_CHECK(lru.device() == hit.device(),
-                "build_lru_plan: lru and hit must be on the same NPU device");
+    TORCH_CHECK(hitMask.device().type() == at::DeviceType::PrivateUse1,
+                "build_lru_plan: hit_mask must be on an NPU device");
+    TORCH_CHECK(lru.device() == hit.device() &&
+                    lru.device() == hitMask.device(),
+                "build_lru_plan: all inputs must be on the same NPU device");
     TORCH_CHECK(lru.scalar_type() == at::kInt && hit.scalar_type() == at::kInt,
-                "build_lru_plan: only int32 inputs are supported");
-    TORCH_CHECK(lru.dim() == 2 && hit.dim() == 2,
-                "build_lru_plan: lru and hit must both be rank-2 tensors");
+                "build_lru_plan: lru and hit must be int32 tensors");
+    TORCH_CHECK(hitMask.scalar_type() == at::kBool,
+                "build_lru_plan: hit_mask must be a bool tensor");
+    TORCH_CHECK(lru.dim() == 2 && hit.dim() == 2 && hitMask.dim() == 2,
+                "build_lru_plan: all inputs must be rank-2 tensors");
     TORCH_CHECK(lru.size(0) == hit.size(0),
                 "build_lru_plan: batch dimensions must match");
+    TORCH_CHECK(hitMask.sizes() == hit.sizes(),
+                "build_lru_plan: hit_mask must have the same shape as hit");
     TORCH_CHECK(hit.size(0) > 0 && hit.size(1) > 0,
                 "build_lru_plan: B and K must both be positive");
+    TORCH_CHECK(hit.is_contiguous(),
+                "build_lru_plan: hit must be contiguous for in-place update");
+    TORCH_CHECK(at::get_overlap_status(hit, lru) == at::MemOverlapStatus::No,
+                "build_lru_plan: hit must not overlap lru storage");
+    TORCH_CHECK(at::get_overlap_status(hit, hitMask) == at::MemOverlapStatus::No,
+                "build_lru_plan: hit must not overlap hit_mask storage");
 
     int64_t batchSize = hit.size(0);
     int64_t k = hit.size(1);
@@ -100,9 +142,8 @@ std::tuple<at::Tensor, at::Tensor> build_lru_plan(
                 "build_lru_plan: lru.shape[1] must equal 2 * hit.shape[1]");
 
     at::Tensor lruContiguous = lru.contiguous();
-    at::Tensor hitContiguous = hit.contiguous();
+    at::Tensor hitMaskContiguous = hitMask.contiguous();
     at::Tensor newLru = at::empty_like(lruContiguous);
-    at::Tensor hitAndMiss = at::empty_like(hitContiguous);
 
     auto ascendcPlatform = platform_ascendc::PlatformAscendCManager::GetInstance();
     int64_t coreNum = static_cast<int64_t>(ascendcPlatform->GetCoreNumAiv());
@@ -114,7 +155,6 @@ std::tuple<at::Tensor, at::Tensor> build_lru_plan(
                 "build_lru_plan: platform UB is smaller than the safety reserve");
 
     int64_t lruStride = AlignUp(lruLength, kInt32PerCacheLine);
-    int64_t hitStride = AlignUp(k, kInt32PerCacheLine);
     int64_t lruTileLength = MakeParallelTileLength(
         lruLength, batchSize, coreNum);
     int64_t hitTileLength = MakeParallelTileLength(k, batchSize, coreNum);
@@ -148,7 +188,6 @@ std::tuple<at::Tensor, at::Tensor> build_lru_plan(
 
     auto bitmapOptions = lruContiguous.options().dtype(at::kFloat);
     at::Tensor hitBitmap = at::zeros({batchSize, lruStride}, bitmapOptions);
-    at::Tensor hitRank = at::empty({batchSize, hitStride}, lruContiguous.options());
     at::Tensor hitCounts = at::empty(
         {batchSize, hitMetaStride}, lruContiguous.options());
     at::Tensor candidateCounts = at::empty(
@@ -170,8 +209,8 @@ std::tuple<at::Tensor, at::Tensor> build_lru_plan(
     uint32_t materializeBlockDim = MakeBlockDim(materializeTaskCount, coreNum);
 
     EXEC_KERNEL_CMD(build_lru_plan_hit_local, hitBlockDim,
-                    hitContiguous, hitBitmap, hitRank, hitCounts,
-                    batchSize, k, lruStride, hitStride, hitMetaStride,
+                    hit, hitBitmap, hitCounts,
+                    batchSize, k, lruStride, hitMetaStride,
                     hitTileLength, hitTileCount);
 
     EXEC_KERNEL_CMD(build_lru_plan_candidate_local, lruBlockDim,
@@ -180,10 +219,10 @@ std::tuple<at::Tensor, at::Tensor> build_lru_plan(
                     lruMetaStride, lruTileLength, lruTileCount);
 
     EXEC_KERNEL_CMD(build_lru_plan_materialize, materializeBlockDim,
-                    lruContiguous, hitContiguous, hitBitmap, hitRank,
+                    lruContiguous, hit, hitMaskContiguous, hitBitmap,
                     hitCounts, candidateValues, candidateCounts,
-                    keepValues, keepCounts, newLru, hitAndMiss,
-                    batchSize, k, lruLength, lruStride, hitStride,
+                    keepValues, keepCounts, newLru,
+                    batchSize, k, lruLength, lruStride,
                     hitMetaStride, lruMetaStride, valueStride,
                     hitTileLength, lruTileLength,
                     hitTileCount, lruTileCount);
@@ -193,7 +232,7 @@ std::tuple<at::Tensor, at::Tensor> build_lru_plan(
                     batchSize, k, lruLength, valueStride, lruMetaStride,
                     lruTileLength, lruTileCount);
 
-    return std::make_tuple(newLru, hitAndMiss);
+    return newLru;
 }
 
 }  // namespace ascend_kernel

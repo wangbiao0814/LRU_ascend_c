@@ -51,6 +51,20 @@ __aicore__ inline void CopyInFloat(LocalTensor<float> dst,
     DataCopyPad(dst, src[srcOffset], params, padParams);
 }
 
+__aicore__ inline void CopyInUint8(LocalTensor<uint8_t> dst,
+                                   GlobalTensor<uint8_t> &src,
+                                   int64_t srcOffset, int64_t length)
+{
+    DataCopyExtParams params{};
+    params.blockCount = 1;
+    params.blockLen = static_cast<uint32_t>(length * sizeof(uint8_t));
+    params.srcStride = 0;
+    params.dstStride = 0;
+    DataCopyPadExtParams<uint8_t> padParams{};
+    padParams.isPad = false;
+    DataCopyPad(dst, src[srcOffset], params, padParams);
+}
+
 __aicore__ inline void CopyOutInt32(GlobalTensor<int32_t> &dst,
                                     int64_t dstOffset,
                                     LocalTensor<int32_t> src,
@@ -115,20 +129,17 @@ __aicore__ inline void WaitMte3ToScalar()
 
 // Stage 1: build the hit bitmap, tile-local miss ranks, and compact counts.
 extern "C" __global__ __aicore__ void build_lru_plan_hit_local(
-    GM_ADDR hit, GM_ADDR hitBitmap, GM_ADDR hitRank, GM_ADDR hitCounts,
-    int64_t batchSize, int64_t k, int64_t lruStride, int64_t hitStride,
+    GM_ADDR hit, GM_ADDR hitBitmap, GM_ADDR hitCounts,
+    int64_t batchSize, int64_t k, int64_t lruStride,
     int64_t hitMetaStride, int64_t hitTileLength, int64_t hitTileCount)
 {
     SetAtomicNone();
     GlobalTensor<int32_t> hitGm;
     GlobalTensor<float> bitmapGm;
-    GlobalTensor<int32_t> hitRankGm;
     GlobalTensor<int32_t> hitCountsGm;
     hitGm.SetGlobalBuffer((__gm__ int32_t *)hit, batchSize * k);
     bitmapGm.SetGlobalBuffer((__gm__ float *)hitBitmap,
                              batchSize * lruStride);
-    hitRankGm.SetGlobalBuffer((__gm__ int32_t *)hitRank,
-                              batchSize * hitStride);
     hitCountsGm.SetGlobalBuffer((__gm__ int32_t *)hitCounts,
                                 batchSize * hitMetaStride);
 
@@ -136,14 +147,13 @@ extern "C" __global__ __aicore__ void build_lru_plan_hit_local(
     TBuf<TPosition::VECCALC> workBuf;
     TBuf<TPosition::VECOUT> bitmapBuf;
     pipe.InitBuffer(workBuf,
-                    static_cast<uint32_t>((2 * hitTileLength +
+                    static_cast<uint32_t>((hitTileLength +
                                            kDataBlockElements) * sizeof(int32_t)));
     pipe.InitBuffer(bitmapBuf,
                     static_cast<uint32_t>(lruStride * sizeof(float)));
     LocalTensor<int32_t> work = workBuf.Get<int32_t>();
     LocalTensor<int32_t> hitLocal = work;
-    LocalTensor<int32_t> rankLocal = work[hitTileLength];
-    LocalTensor<int32_t> countLocal = work[2 * hitTileLength];
+    LocalTensor<int32_t> countLocal = work[hitTileLength];
     LocalTensor<float> bitmapLocal = bitmapBuf.Get<float>();
 
     int64_t taskCount = batchSize * hitTileCount;
@@ -163,18 +173,14 @@ extern "C" __global__ __aicore__ void build_lru_plan_hit_local(
         for (int64_t p = 0; p < validLen; ++p) {
             int32_t id = hitLocal.GetValue(p);
             if (id == -1) {
-                rankLocal.SetValue(p, prefix);
                 ++prefix;
             } else {
-                rankLocal.SetValue(p, static_cast<int32_t>(-1));
                 bitmapLocal.SetValue(id, 1.0f);
             }
         }
         countLocal.SetValue(0, prefix);
 
         WaitScalarToMte3();
-        CopyOutInt32(hitRankGm, b * hitStride + start,
-                     rankLocal, validLen);
         CopyOutInt32(hitCountsGm, b * hitMetaStride + ht,
                      countLocal, 1);
         CopyOutFloatAtomic(bitmapGm, b * lruStride,
@@ -251,36 +257,34 @@ extern "C" __global__ __aicore__ void build_lru_plan_candidate_local(
     }
 }
 
-// Stage 3: fill misses and, in independent LRU-tile tasks, compact the IDs
-// that remain after eviction. This removes the selected-bitmap stage.
+// Stage 3: fill misses in-place and, in independent LRU-tile tasks,
+// compact the IDs that remain after eviction.
 extern "C" __global__ __aicore__ void build_lru_plan_materialize(
-    GM_ADDR lru, GM_ADDR hit, GM_ADDR hitBitmap, GM_ADDR hitRank,
+    GM_ADDR lru, GM_ADDR hit, GM_ADDR hitMask, GM_ADDR hitBitmap,
     GM_ADDR hitCounts, GM_ADDR candidateValues, GM_ADDR candidateCounts,
     GM_ADDR keepValues, GM_ADDR keepCounts, GM_ADDR newLru,
-    GM_ADDR hitAndMiss, int64_t batchSize, int64_t k, int64_t lruLength,
-    int64_t lruStride, int64_t hitStride, int64_t hitMetaStride,
-    int64_t lruMetaStride, int64_t valueStride, int64_t hitTileLength,
-    int64_t lruTileLength, int64_t hitTileCount, int64_t lruTileCount)
+    int64_t batchSize, int64_t k, int64_t lruLength,
+    int64_t lruStride, int64_t hitMetaStride, int64_t lruMetaStride,
+    int64_t valueStride, int64_t hitTileLength, int64_t lruTileLength,
+    int64_t hitTileCount, int64_t lruTileCount)
 {
     SetAtomicNone();
     GlobalTensor<int32_t> lruGm;
     GlobalTensor<int32_t> hitGm;
+    GlobalTensor<uint8_t> hitMaskGm;
     GlobalTensor<float> bitmapGm;
-    GlobalTensor<int32_t> hitRankGm;
     GlobalTensor<int32_t> hitCountsGm;
     GlobalTensor<int32_t> candidateValuesGm;
     GlobalTensor<int32_t> candidateCountsGm;
     GlobalTensor<int32_t> keepValuesGm;
     GlobalTensor<int32_t> keepCountsGm;
     GlobalTensor<int32_t> newLruGm;
-    GlobalTensor<int32_t> hitAndMissGm;
     lruGm.SetGlobalBuffer((__gm__ int32_t *)lru,
                            batchSize * lruLength);
     hitGm.SetGlobalBuffer((__gm__ int32_t *)hit, batchSize * k);
+    hitMaskGm.SetGlobalBuffer((__gm__ uint8_t *)hitMask, batchSize * k);
     bitmapGm.SetGlobalBuffer((__gm__ float *)hitBitmap,
                              batchSize * lruStride);
-    hitRankGm.SetGlobalBuffer((__gm__ int32_t *)hitRank,
-                              batchSize * hitStride);
     hitCountsGm.SetGlobalBuffer((__gm__ int32_t *)hitCounts,
                                 batchSize * hitMetaStride);
     candidateValuesGm.SetGlobalBuffer((__gm__ int32_t *)candidateValues,
@@ -293,32 +297,25 @@ extern "C" __global__ __aicore__ void build_lru_plan_materialize(
                                  batchSize * lruMetaStride);
     newLruGm.SetGlobalBuffer((__gm__ int32_t *)newLru,
                              batchSize * lruLength);
-    hitAndMissGm.SetGlobalBuffer((__gm__ int32_t *)hitAndMiss,
-                                 batchSize * k);
 
-    int64_t maxTileLength = hitTileLength > lruTileLength
-        ? hitTileLength : lruTileLength;
+    int64_t metadataElements = hitMetaStride + lruMetaStride;
+    int64_t maskBytes = (hitTileLength + 31) / 32 * 32;
+    int64_t hitBranchBytes = valueStride * sizeof(int32_t) +
+                             metadataElements * sizeof(int32_t) +
+                             2 * hitTileLength * sizeof(int32_t) +
+                             kDataBlockElements * sizeof(int32_t) + maskBytes;
+    int64_t lruBranchBytes = lruStride * sizeof(float) +
+                             metadataElements * sizeof(int32_t) +
+                             2 * lruTileLength * sizeof(int32_t) +
+                             kDataBlockElements * sizeof(int32_t);
+    int64_t workBytes = hitBranchBytes > lruBranchBytes
+        ? hitBranchBytes : lruBranchBytes;
+
     TPipe pipe;
     TBuf<TPosition::VECCALC> workBuf;
-    int64_t workElements = lruStride + 3 * maxTileLength +
-                           hitMetaStride + lruMetaStride + valueStride +
-                           kDataBlockElements;
-    pipe.InitBuffer(workBuf,
-                    static_cast<uint32_t>(workElements * sizeof(int32_t)));
+    pipe.InitBuffer(workBuf, static_cast<uint32_t>(workBytes));
     LocalTensor<int32_t> work = workBuf.Get<int32_t>();
-    LocalTensor<float> bitmapLocal = work.ReinterpretCast<float>();
-    int64_t dataBase = lruStride;
-    LocalTensor<int32_t> data0Local = work[dataBase];
-    LocalTensor<int32_t> data1Local = work[dataBase + maxTileLength];
-    LocalTensor<int32_t> outputLocal = work[dataBase + 2 * maxTileLength];
-    int64_t hitCountBase = dataBase + 3 * maxTileLength;
-    LocalTensor<int32_t> hitCountLocal = work[hitCountBase];
-    int64_t candidateCountBase = hitCountBase + hitMetaStride;
-    LocalTensor<int32_t> candidateCountLocal = work[candidateCountBase];
-    int64_t candidateValueBase = candidateCountBase + lruMetaStride;
-    LocalTensor<int32_t> candidateValueLocal = work[candidateValueBase];
-    LocalTensor<int32_t> scalarLocal =
-        work[candidateValueBase + valueStride];
+    LocalTensor<uint8_t> workBytesLocal = work.ReinterpretCast<uint8_t>();
 
     int64_t tasksPerRow = hitTileCount + lruTileCount;
     int64_t taskCount = batchSize * tasksPerRow;
@@ -331,9 +328,22 @@ extern "C" __global__ __aicore__ void build_lru_plan_materialize(
             int64_t ht = localTask;
             int64_t start = ht * hitTileLength;
             int64_t validLen = MinInt64(hitTileLength, k - start);
-            CopyInInt32(data0Local, hitGm, b * k + start, validLen);
-            CopyInInt32(data1Local, hitRankGm,
-                        b * hitStride + start, validLen);
+
+            LocalTensor<int32_t> candidateValueLocal = work;
+            int64_t hitBase = valueStride;
+            LocalTensor<int32_t> hitLocal = work[hitBase];
+            int64_t outputBase = hitBase + hitTileLength;
+            LocalTensor<int32_t> outputLocal = work[outputBase];
+            int64_t hitCountBase = outputBase + hitTileLength;
+            LocalTensor<int32_t> hitCountLocal = work[hitCountBase];
+            int64_t candidateCountBase = hitCountBase + hitMetaStride;
+            LocalTensor<int32_t> candidateCountLocal = work[candidateCountBase];
+            int64_t scalarBase = candidateCountBase + lruMetaStride;
+            LocalTensor<uint8_t> maskLocal = workBytesLocal[
+                (scalarBase + kDataBlockElements) * sizeof(int32_t)];
+
+            CopyInInt32(hitLocal, hitGm, b * k + start, validLen);
+            CopyInUint8(maskLocal, hitMaskGm, b * k + start, validLen);
             CopyInInt32(hitCountLocal, hitCountsGm,
                         b * hitMetaStride, hitMetaStride);
             CopyInInt32(candidateCountLocal, candidateCountsGm,
@@ -343,39 +353,32 @@ extern "C" __global__ __aicore__ void build_lru_plan_materialize(
             WaitMte2ToScalar();
 
             int32_t missBase = 0;
-            int32_t rowMissCount = 0;
-            for (int64_t tile = 0; tile < hitTileCount; ++tile) {
-                int32_t count = hitCountLocal.GetValue(tile);
-                if (tile < ht) {
-                    missBase += count;
-                }
-                rowMissCount += count;
+            for (int64_t tile = 0; tile < ht; ++tile) {
+                missBase += hitCountLocal.GetValue(tile);
             }
 
+            int32_t localMissRank = 0;
             for (int64_t p = 0; p < validLen; ++p) {
-                int32_t id = data0Local.GetValue(p);
-                int32_t outputId = id;
-                if (id == -1) {
-                    int32_t rank = data1Local.GetValue(p) + missBase;
-                    if (rank >= 0 && rank < rowMissCount) {
-                        for (int64_t tile = lruTileCount; tile > 0; --tile) {
-                            int64_t lt = tile - 1;
-                            int32_t count = candidateCountLocal.GetValue(lt);
-                            if (rank < count) {
-                                outputId = candidateValueLocal.GetValue(
-                                    lt * lruTileLength + rank);
-                                break;
-                            }
-                            rank -= count;
+                int32_t outputId = hitLocal.GetValue(p);
+                if (maskLocal.GetValue(p) == 0) {
+                    int32_t rank = missBase + localMissRank;
+                    for (int64_t tile = lruTileCount; tile > 0; --tile) {
+                        int64_t lt = tile - 1;
+                        int32_t count = candidateCountLocal.GetValue(lt);
+                        if (rank < count) {
+                            outputId = candidateValueLocal.GetValue(
+                                lt * lruTileLength + rank);
+                            break;
                         }
+                        rank -= count;
                     }
+                    ++localMissRank;
                 }
                 outputLocal.SetValue(p, outputId);
             }
 
             WaitScalarToMte3();
-            CopyOutInt32(hitAndMissGm, b * k + start,
-                         outputLocal, validLen);
+            CopyOutInt32(hitGm, b * k + start, outputLocal, validLen);
             CopyOutInt32(newLruGm, b * lruLength + start,
                          outputLocal, validLen);
             WaitMte3ToScalar();
@@ -383,9 +386,22 @@ extern "C" __global__ __aicore__ void build_lru_plan_materialize(
             int64_t lt = localTask - hitTileCount;
             int64_t start = lt * lruTileLength;
             int64_t validLen = MinInt64(lruTileLength, lruLength - start);
+
+            LocalTensor<float> bitmapLocal = work.ReinterpretCast<float>();
+            int64_t lruBase = lruStride;
+            LocalTensor<int32_t> lruLocal = work[lruBase];
+            int64_t outputBase = lruBase + lruTileLength;
+            LocalTensor<int32_t> outputLocal = work[outputBase];
+            int64_t hitCountBase = outputBase + lruTileLength;
+            LocalTensor<int32_t> hitCountLocal = work[hitCountBase];
+            int64_t candidateCountBase = hitCountBase + hitMetaStride;
+            LocalTensor<int32_t> candidateCountLocal = work[candidateCountBase];
+            LocalTensor<int32_t> scalarLocal =
+                work[candidateCountBase + lruMetaStride];
+
             CopyInFloat(bitmapLocal, bitmapGm,
                         b * lruStride, lruLength);
-            CopyInInt32(data0Local, lruGm,
+            CopyInInt32(lruLocal, lruGm,
                         b * lruLength + start, validLen);
             CopyInInt32(hitCountLocal, hitCountsGm,
                         b * hitMetaStride, hitMetaStride);
@@ -404,7 +420,7 @@ extern "C" __global__ __aicore__ void build_lru_plan_materialize(
             int32_t withinReverse = candidateCountLocal.GetValue(lt);
             int32_t keepCount = 0;
             for (int64_t p = 0; p < validLen; ++p) {
-                int32_t id = data0Local.GetValue(p);
+                int32_t id = lruLocal.GetValue(p);
                 if (bitmapLocal.GetValue(id) == 0.0f) {
                     --withinReverse;
                     int32_t reverseRank = suffixOffset + withinReverse;

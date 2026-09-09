@@ -12,14 +12,21 @@ except ImportError:
     torch_npu = None
 
 
-def build_lru_plan_reference(lru, hit):
+def build_lru_plan_reference(lru, hit, hit_mask=None):
+    if hit_mask is None:
+        hit_mask = hit.ne(-1)
     output_lru = []
     output_hit = []
-    for lru_row, hit_row in zip(lru.tolist(), hit.tolist()):
-        hit_set = {value for value in hit_row if value != -1}
+    for lru_row, hit_row, mask_row in zip(
+        lru.tolist(), hit.tolist(), hit_mask.tolist()
+    ):
+        hit_set = {value for value, is_hit in zip(hit_row, mask_row) if is_hit}
         miss_values = [value for value in reversed(lru_row) if value not in hit_set]
         miss_iter = iter(miss_values)
-        filled = [value if value != -1 else next(miss_iter) for value in hit_row]
+        filled = [
+            value if is_hit else next(miss_iter)
+            for value, is_hit in zip(hit_row, mask_row)
+        ]
         selected = set(filled)
         remaining = [value for value in lru_row if value not in selected]
         output_hit.append(filled)
@@ -158,7 +165,9 @@ def make_parallel_tile_length(logical_length, batch_size, core_num):
     return min(max(tile_length, 8), 256)
 
 
-def build_lru_plan_parallel_staged(lru, hit, hit_tile_length, lru_tile_length):
+def build_lru_plan_parallel_staged(
+    lru, hit, hit_mask, hit_tile_length, lru_tile_length
+):
     """CPU simulation of the fused four-kernel pipeline."""
     batch_size, k = hit.shape
     lru_length = 2 * k
@@ -168,16 +177,15 @@ def build_lru_plan_parallel_staged(lru, hit, hit_tile_length, lru_tile_length):
     for batch in range(batch_size):
         lru_row = lru[batch].tolist()
         hit_row = hit[batch].tolist()
+        mask_row = hit_mask[batch].tolist()
 
         hit_bitmap = [0] * lru_length
-        hit_rank = [-1] * k
         hit_counts = []
         for start in range(0, k, hit_tile_length):
             prefix = 0
             for index in range(start, min(start + hit_tile_length, k)):
                 value = hit_row[index]
                 if value == -1:
-                    hit_rank[index] = prefix
                     prefix += 1
                 else:
                     hit_bitmap[value] += 1
@@ -198,19 +206,22 @@ def build_lru_plan_parallel_staged(lru, hit, hit_tile_length, lru_tile_length):
             candidate_counts.append(len(values))
 
         filled = []
-        for index, value in enumerate(hit_row):
-            output_value = value
-            if value == -1:
-                hit_tile = index // hit_tile_length
-                rank = hit_rank[index] + sum(hit_counts[:hit_tile])
-                assert 0 <= rank < miss_count
-                for tile in range(len(candidate_counts) - 1, -1, -1):
-                    tile_count = candidate_counts[tile]
-                    if rank < tile_count:
-                        output_value = candidate_values[tile][rank]
-                        break
-                    rank -= tile_count
-            filled.append(output_value)
+        for hit_tile, start in enumerate(range(0, k, hit_tile_length)):
+            miss_base = sum(hit_counts[:hit_tile])
+            local_miss_rank = 0
+            for index in range(start, min(start + hit_tile_length, k)):
+                output_value = hit_row[index]
+                if not mask_row[index]:
+                    rank = miss_base + local_miss_rank
+                    assert 0 <= rank < miss_count
+                    for tile in range(len(candidate_counts) - 1, -1, -1):
+                        tile_count = candidate_counts[tile]
+                        if rank < tile_count:
+                            output_value = candidate_values[tile][rank]
+                            break
+                        rank -= tile_count
+                    local_miss_rank += 1
+                filled.append(output_value)
 
         keep_values = []
         for tile, start in enumerate(range(0, lru_length, lru_tile_length)):
@@ -269,9 +280,10 @@ def test_fully_parallel_target_shape_matches_reference():
     assert (2 * k + lru_tile_length - 1) // lru_tile_length >= core_num
 
     lru, hit = make_inputs(batch_size, k, seed=4096)
-    expected = build_lru_plan_reference(lru, hit)
+    hit_mask = hit.ne(-1)
+    expected = build_lru_plan_reference(lru, hit, hit_mask)
     actual = build_lru_plan_parallel_staged(
-        lru, hit, hit_tile_length, lru_tile_length
+        lru, hit, hit_mask, hit_tile_length, lru_tile_length
     )
     torch.testing.assert_close(actual[0], expected[0], rtol=0, atol=0)
     torch.testing.assert_close(actual[1], expected[1], rtol=0, atol=0)
@@ -284,9 +296,10 @@ def test_fully_parallel_pipeline_random_shapes(k):
     hit_tile_length = make_parallel_tile_length(k, batch_size, core_num)
     lru_tile_length = make_parallel_tile_length(2 * k, batch_size, core_num)
     lru, hit = make_inputs(batch_size, k, seed=8192 + k)
-    expected = build_lru_plan_reference(lru, hit)
+    hit_mask = hit.ne(-1)
+    expected = build_lru_plan_reference(lru, hit, hit_mask)
     actual = build_lru_plan_parallel_staged(
-        lru, hit, hit_tile_length, lru_tile_length
+        lru, hit, hit_mask, hit_tile_length, lru_tile_length
     )
     torch.testing.assert_close(actual[0], expected[0], rtol=0, atol=0)
     torch.testing.assert_close(actual[1], expected[1], rtol=0, atol=0)
@@ -341,48 +354,87 @@ def npu_device():
 )
 def test_random_valid_inputs(npu_device, batch_size, k, seed):
     lru, hit = make_inputs(batch_size, k, seed)
-    expected_lru, expected_hit = build_lru_plan_reference(lru, hit)
+    hit_mask = hit.ne(-1)
+    expected_lru, expected_hit = build_lru_plan_reference(lru, hit, hit_mask)
+    hit_npu = hit.to(npu_device)
+    hit_mask_npu = hit_mask.to(npu_device)
+    hit_mask_before = hit_mask_npu.clone()
 
-    actual_lru, actual_hit = torch.ops.npu.build_lru_plan(
-        lru.to(npu_device), hit.to(npu_device)
+    actual_lru = torch.ops.npu.build_lru_plan(
+        lru.to(npu_device), hit_npu, hit_mask_npu
     )
 
     torch.testing.assert_close(actual_lru.cpu(), expected_lru, rtol=0, atol=0)
-    torch.testing.assert_close(actual_hit.cpu(), expected_hit, rtol=0, atol=0)
-    torch.testing.assert_close(actual_lru[:, :k].cpu(), actual_hit.cpu(), rtol=0, atol=0)
+    torch.testing.assert_close(hit_npu.cpu(), expected_hit, rtol=0, atol=0)
+    torch.testing.assert_close(actual_lru[:, :k].cpu(), hit_npu.cpu(), rtol=0, atol=0)
+    torch.testing.assert_close(hit_mask_npu, hit_mask_before, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("all_miss,no_miss", [(True, False), (False, True)])
 def test_miss_extremes(npu_device, all_miss, no_miss):
     lru, hit = make_inputs(3, 129, 11, all_miss=all_miss, no_miss=no_miss)
-    expected_lru, expected_hit = build_lru_plan_reference(lru, hit)
-    actual_lru, actual_hit = torch.ops.npu.build_lru_plan(
-        lru.to(npu_device), hit.to(npu_device)
+    hit_mask = hit.ne(-1)
+    expected_lru, expected_hit = build_lru_plan_reference(lru, hit, hit_mask)
+    hit_npu = hit.to(npu_device)
+    actual_lru = torch.ops.npu.build_lru_plan(
+        lru.to(npu_device), hit_npu, hit_mask.to(npu_device)
     )
     torch.testing.assert_close(actual_lru.cpu(), expected_lru, rtol=0, atol=0)
-    torch.testing.assert_close(actual_hit.cpu(), expected_hit, rtol=0, atol=0)
+    torch.testing.assert_close(hit_npu.cpu(), expected_hit, rtol=0, atol=0)
 
 
-def test_noncontiguous_inputs(npu_device):
+def test_noncontiguous_read_only_inputs(npu_device):
     lru, hit = make_inputs(3, 65, 21)
-    lru_noncontiguous = lru.t().contiguous().t()
-    hit_noncontiguous = hit.t().contiguous().t()
+    hit_mask = hit.ne(-1)
+    lru_noncontiguous = lru.to(npu_device).t().contiguous().t()
+    hit_mask_noncontiguous = hit_mask.to(npu_device).t().contiguous().t()
+    hit_npu = hit.to(npu_device)
     assert not lru_noncontiguous.is_contiguous()
+    assert not hit_mask_noncontiguous.is_contiguous()
+
+    expected_lru, expected_hit = build_lru_plan_reference(lru, hit, hit_mask)
+    actual_lru = torch.ops.npu.build_lru_plan(
+        lru_noncontiguous, hit_npu, hit_mask_noncontiguous
+    )
+    torch.testing.assert_close(actual_lru.cpu(), expected_lru, rtol=0, atol=0)
+    torch.testing.assert_close(hit_npu.cpu(), expected_hit, rtol=0, atol=0)
+
+
+def test_rejects_noncontiguous_hit(npu_device):
+    lru, hit = make_inputs(3, 65, 22)
+    hit_mask = hit.ne(-1)
+    hit_noncontiguous = hit.to(npu_device).t().contiguous().t()
     assert not hit_noncontiguous.is_contiguous()
 
-    expected_lru, expected_hit = build_lru_plan_reference(lru, hit)
-    actual_lru, actual_hit = torch.ops.npu.build_lru_plan(
-        lru_noncontiguous.to(npu_device), hit_noncontiguous.to(npu_device)
-    )
-    torch.testing.assert_close(actual_lru.cpu(), expected_lru, rtol=0, atol=0)
-    torch.testing.assert_close(actual_hit.cpu(), expected_hit, rtol=0, atol=0)
+    with pytest.raises(RuntimeError, match="hit must be contiguous"):
+        torch.ops.npu.build_lru_plan(
+            lru.to(npu_device), hit_noncontiguous, hit_mask.to(npu_device)
+        )
 
 
 def test_rejects_wrong_dtype(npu_device):
     lru, hit = make_inputs(1, 3, 31)
-    with pytest.raises(RuntimeError, match="only int32"):
+    hit_mask = hit.ne(-1)
+    with pytest.raises(RuntimeError, match="lru and hit must be int32"):
         torch.ops.npu.build_lru_plan(
-            lru.to(device=npu_device, dtype=torch.int64), hit.to(npu_device)
+            lru.to(device=npu_device, dtype=torch.int64),
+            hit.to(npu_device),
+            hit_mask.to(npu_device),
+        )
+
+
+def test_rejects_wrong_mask(npu_device):
+    lru, hit = make_inputs(2, 9, 32)
+    with pytest.raises(RuntimeError, match="hit_mask must be a bool"):
+        torch.ops.npu.build_lru_plan(
+            lru.to(npu_device), hit.to(npu_device), hit.to(npu_device)
+        )
+
+    with pytest.raises(RuntimeError, match="same shape as hit"):
+        torch.ops.npu.build_lru_plan(
+            lru.to(npu_device),
+            hit.to(npu_device),
+            hit.ne(-1)[:, :-1].to(npu_device),
         )
 
 
@@ -412,15 +464,19 @@ def run_simple_test():
                 all_miss=all_miss,
                 no_miss=no_miss,
             )
-            expected_lru, expected_hit = build_lru_plan_reference(lru, hit)
-            actual_lru, actual_hit = torch.ops.npu.build_lru_plan(
-                lru.to(device), hit.to(device)
+            hit_mask = hit.ne(-1)
+            expected_lru, expected_hit = build_lru_plan_reference(
+                lru, hit, hit_mask
+            )
+            hit_npu = hit.to(device)
+            actual_lru = torch.ops.npu.build_lru_plan(
+                lru.to(device), hit_npu, hit_mask.to(device)
             )
             torch.testing.assert_close(
                 actual_lru.cpu(), expected_lru, rtol=0, atol=0
             )
             torch.testing.assert_close(
-                actual_hit.cpu(), expected_hit, rtol=0, atol=0
+                hit_npu.cpu(), expected_hit, rtol=0, atol=0
             )
             print(f"PASS: B={batch_size}, K={k}, all_miss={all_miss}, no_miss={no_miss}")
 

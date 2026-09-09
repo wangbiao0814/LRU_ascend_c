@@ -11,14 +11,12 @@
 #ifndef OPS_H
 #define OPS_H
 
-#include <tuple>
-
 namespace ascend_kernel {
 
 at::Tensor helloworld(const at::Tensor &x, const at::Tensor &y);
 
-std::tuple<at::Tensor, at::Tensor> build_lru_plan(
-    const at::Tensor &lru, const at::Tensor &hit);
+at::Tensor build_lru_plan(const at::Tensor &lru, at::Tensor &hit,
+                          const at::Tensor &hit_mask);
 
 at::Tensor avg_pool3d(const at::Tensor &self, at::IntArrayRef kernel_size, at::IntArrayRef stride,
                       at::IntArrayRef padding, bool ceil_mode, bool count_include_pad,
