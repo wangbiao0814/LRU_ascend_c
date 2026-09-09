@@ -159,7 +159,7 @@ def make_parallel_tile_length(logical_length, batch_size, core_num):
 
 
 def build_lru_plan_parallel_staged(lru, hit, hit_tile_length, lru_tile_length):
-    """CPU simulation of the packed-value, fully parallel kernel pipeline."""
+    """CPU simulation of the three fused kernels and their leader phases."""
     batch_size, k = hit.shape
     lru_length = 2 * k
     output_lru = []
@@ -169,7 +169,7 @@ def build_lru_plan_parallel_staged(lru, hit, hit_tile_length, lru_tile_length):
         lru_row = lru[batch].tolist()
         hit_row = hit[batch].tolist()
 
-        hit_bitmap = [0] * lru_length
+        # Fused K1+K2: tile-parallel local rank/count, then one row leader.
         hit_rank = [-1] * k
         hit_counts = []
         for start in range(0, k, hit_tile_length):
@@ -179,19 +179,21 @@ def build_lru_plan_parallel_staged(lru, hit, hit_tile_length, lru_tile_length):
                 if value == -1:
                     hit_rank[index] = prefix
                     prefix += 1
-                else:
-                    hit_bitmap[value] += 1
             hit_counts.append(prefix)
 
+        hit_offsets = []
         offset = 0
-        for tile, count in enumerate(hit_counts):
-            start = tile * hit_tile_length
-            for index in range(start, min(start + hit_tile_length, k)):
-                if hit_rank[index] >= 0:
-                    hit_rank[index] += offset
+        for count in hit_counts:
+            hit_offsets.append(offset)
             offset += count
         miss_count = offset
+        hit_bitmap = [0] * lru_length
+        for value in hit_row:
+            if value >= 0:
+                hit_bitmap[value] = 1
 
+        # Fused K3+K4+K5: parallel candidate tiles, leader packing and
+        # selected-bitmap construction, then parallel hit filling.
         candidate_values = []
         candidate_counts = []
         for start in range(0, lru_length, lru_tile_length):
@@ -204,27 +206,28 @@ def build_lru_plan_parallel_staged(lru, hit, hit_tile_length, lru_tile_length):
             candidate_values.append(values)
             candidate_counts.append(len(values))
 
-        candidate_offsets = [0] * len(candidate_counts)
-        offset = 0
+        candidate_packed = []
         for tile in range(len(candidate_counts) - 1, -1, -1):
-            candidate_offsets[tile] = offset
-            offset += candidate_counts[tile]
+            remaining = miss_count - len(candidate_packed)
+            candidate_packed.extend(candidate_values[tile][:remaining])
+            if len(candidate_packed) == miss_count:
+                break
+
+        selected_bitmap = hit_bitmap.copy()
+        for value in candidate_packed:
+            selected_bitmap[value] = 1
 
         filled = []
-        selected_bitmap = [0] * lru_length
         for index, value in enumerate(hit_row):
             output_value = value
             if value == -1:
-                rank = hit_rank[index]
+                tile = index // hit_tile_length
+                rank = hit_rank[index] + hit_offsets[tile]
                 assert 0 <= rank < miss_count
-                for tile, tile_offset in enumerate(candidate_offsets):
-                    tile_count = candidate_counts[tile]
-                    if tile_offset <= rank < tile_offset + tile_count:
-                        output_value = candidate_values[tile][rank - tile_offset]
-                        break
+                output_value = candidate_packed[rank]
             filled.append(output_value)
-            selected_bitmap[output_value] += 1
 
+        # Fused K6+K7+K8: parallel keep tiles, leader offsets, tail write.
         keep_values = []
         for start in range(0, lru_length, lru_tile_length):
             end = min(start + lru_tile_length, lru_length)

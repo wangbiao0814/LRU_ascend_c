@@ -1,11 +1,18 @@
-# build_lru_plan 全 AIV 并行设计
+# build_lru_plan 三 Kernel 融合设计
 
 ## 1. 目标与结论
 
-`build_lru_plan` 对每个 batch 的 LRU 队列执行一次批量更新。当前实现采用 8 个
-AscendC Vector Kernel，并把原先按行串行的 bitmap、scan、fill 和 write 阶段全部
-改为二维 `(batch, tile)` 任务。Host 根据运行设备的 AIV 数动态选择 Tile，使逻辑
-数据至少包含同等数量的 32B 数据块时，每个阶段都有不少于 AIV 数量的有效任务。
+`build_lru_plan` 对每个 batch 的 LRU 队列执行一次批量更新。优化后把原来的
+8 个 AscendC Vector Kernel 融合为 3 个：
+
+| 融合 Kernel | 原阶段 | 核间屏障数 |
+|---|---|---:|
+| `build_lru_plan_hit_fused` | K1 hit-local + K2 hit-scan | 1 |
+| `build_lru_plan_candidate_fill_fused` | K3 candidate-local + K4 scan + K5 fill | 2 |
+| `build_lru_plan_keep_write_fused` | K6 keep-local + K7 scan + K8 write | 2 |
+
+融合 Kernel 内通过软 `SyncAll` 建立 GM 可见的阶段边界。Scan 阶段不再让每个
+Tile 重复扫描整张 count 表，而是由每个 batch 的一个 leader 只扫描一次。
 
 对重点场景 `B=1, K=2048, AIV=40`：
 
@@ -14,20 +21,8 @@ TH = 48,  NH = ceil(2048 / 48) = 43
 TL = 96,  NL = ceil(4096 / 96) = 43
 ```
 
-| Kernel | 有效任务数 | blockDim | 活跃 AIV |
-|---|---:|---:|---:|
-| K1 hit local | 43 | 40 | 40 |
-| K2 hit scan | 43 | 40 | 40 |
-| K3 candidate local | 43 | 40 | 40 |
-| K4 candidate scan | 43 | 40 | 40 |
-| K5 fill | 43 | 40 | 40 |
-| K6 keep local | 43 | 40 | 40 |
-| K7 keep scan | 43 | 40 | 40 |
-| K8 write | 86 | 40 | 40 |
-
-这里的“占满”指每个 AIV 都获得有效 Tile 任务，不代表执行单元利用率必然为 100%。
-该算子仍有大量 Scalar 索引访问和 8 次 Kernel launch，最终性能需要在目标 NPU 上
-通过 profiler 验证。
+三个融合 Kernel 均使用 40 个 block。所有 block 无条件执行相同次数的
+`SyncAll`；没有本阶段任务的 block 只参加同步，不访问阶段数据。
 
 ## 2. 接口与输入约束
 
@@ -49,11 +44,8 @@ build_lru_plan(Tensor lru, Tensor hit) ->
 | `new_lru` | 输出 | `[B, 2K]` | `int32` | 更新后的 LRU |
 | `hit_and_miss` | 输出 | `[B, K]` | `int32` | 用淘汰 ID 填充 miss 后的序列 |
 
-Host 检查设备、dtype、二维 shape、batch、`lru.size(1) == 2K`、正数维度和
-动态 UB 容量。非连续输入先执行 `.contiguous()`。
-
-性能路径不复制输入到 CPU 做值域检查。调用方必须保证每行 `lru` 是
-`0..2K-1` 的排列，`hit` 中有效 ID 位于该范围且互不重复；否则行为未定义。
+调用方必须保证每行 `lru` 是 `0..2K-1` 的排列，`hit` 中有效 ID 位于该范围且
+互不重复。非连续输入由 Host 执行 `.contiguous()`。
 
 ## 3. 算子语义
 
@@ -62,7 +54,7 @@ Host 检查设备、dtype、二维 shape、batch、`lru.size(1) == 2K`、正数�
 1. 保留 `hit` 中非 `-1` 的 ID。
 2. 从原 `lru` 的 LRU 端向 MRU 端选择未命中的 ID。
 3. 按 miss 从左到右的顺序填入这些 ID，得到 `hit_and_miss`。
-4. 把 `hit_and_miss` 放入 `new_lru` 的前 `K` 项。
+4. 把 `hit_and_miss` 写入 `new_lru` 的前 `K` 项。
 5. 原 `lru` 中未被本轮选中的 ID 稳定压缩到后 `K` 项。
 
 ## 4. 动态二维 Tiling
@@ -70,15 +62,14 @@ Host 检查设备、dtype、二维 shape、batch、`lru.size(1) == 2K`、正数�
 ```text
 L  = 2K
 C  = 设备 AIV 数
-R  = ceil(C / B)                    # 每行目标 Tile 数
+R  = ceil(C / B)
 TH = clamp(AlignDown(K / R, 8), 8, 256)
 TL = clamp(AlignDown(L / R, 8), 8, 256)
 NH = ceil(K / TH)
 NL = ceil(L / TL)
 ```
 
-Tile 长度按 8 个 `int32` 对齐，保证常规 Tile 从 32B 边界开始。尾 Tile 的非对齐
-逻辑长度由 `DataCopyPad` 处理。每个 Kernel 使用交错取任务：
+Tile 长度按 8 个 `int32` 对齐。各并行阶段使用交错任务分配：
 
 ```cpp
 for (int64_t task = GetBlockIdx(); task < taskCount;
@@ -87,121 +78,137 @@ for (int64_t task = GetBlockIdx(); task < taskCount;
 }
 ```
 
-Host 动态设置 `blockDim = min(taskCount, coreNum)`，最少为 1。若 shape 本身少于
-设备 AIV 数量的 32B 数据块，无法产生足够的有效并行任务，这是小 shape 的物理
-并行度上限。
+含不同任务空间的融合 Kernel 使用：
 
-## 5. 八阶段 Kernel
+```text
+blockDim = min(coreNum, max(各阶段 taskCount))
+```
 
-### K1 `build_lru_plan_hit_local`
+且 `blockDim` 必须不大于设备实际 AIV 数。
 
-任务空间为 `B * NH`。每个 hit Tile 在 UB 中创建一份私有 float bitmap，计算 Tile
-内 miss exclusive rank，并把 bitmap 通过 float atomic add 累加到预先清零的 GM
-`hit_bitmap`。每个 Tile 的 miss count 写入独占 32B 槽。
+## 5. 三个融合 Kernel
 
-### K2 `build_lru_plan_hit_scan`
+### 5.1 hit_fused（原 K1 + K2）
 
-任务空间为 `B * NH`。每个 hit Tile 独立读取该行全部 Tile count，只累加位于自己
-之前的 count，并把 offset 加到本 Tile 的 miss rank。最后一个 Tile 写出整行
-`miss_count`。该方式用少量重复读取消除原先“一行一个核”的串行扫描。
+阶段 A：`B * NH` 个任务并行计算 Tile 内 miss exclusive rank，并写出
+`hitRank` 和 `(localCount, localCount)`。
 
-### K3 `build_lru_plan_candidate_local`
+阶段 B：所有 block 调用一次 `SyncAll`。随后每个 batch 的 leader：
 
-任务空间为 `B * NL`。每个 LRU Tile 读取 hit bitmap，从 Tile 右端向左筛选未命中
-ID，并把候选 ID 直接紧凑写入本 Tile 的固定长度 slot；不再生成逐元素 lru rank。
+1. 扫描该行 `NH` 个 count，在 lane 0 写 Tile exclusive offset，lane 1 保留 count；
+2. 读取一次完整 hit 行，构造 `int8 hitBitmap`；
+3. 写出 `missCount`。
 
-### K4 `build_lru_plan_candidate_scan`
+`hitRank` 保持 Tile 内 rank。后续 fill 使用：
 
-任务空间为 `B * NL`。每个 LRU Tile 读取全部 count，独立累加其右侧 Tile 的 count，
-得到反向 exclusive offset。计数槽 lane 0 保存 offset，lane 1 保留原 count；并行
-核心只写自己的 32B 槽，因此不存在覆盖竞争。
+```text
+globalMissRank = hitRank[index] + hitTileInfo[tile].offset
+```
 
-### K5 `build_lru_plan_fill`
+这样避免原 K2 对 `hitRank` 的一次 GM 读和一次 GM 写。
 
-任务空间为 `B * NH`。每个 hit Tile 读取候选值和 `(offset, count)`，填充本 Tile 的
-miss，写出对应 `hit_and_miss` 区间。同时构造私有 selected bitmap，并通过 float
-atomic add 累加到预先清零的 GM `selected_bitmap`。
+### 5.2 candidate_fill_fused（原 K3 + K4 + K5）
 
-### K6 `build_lru_plan_keep_local`
+阶段 A：`B * NL` 个任务并行读取 `hitBitmap`，从每个 LRU Tile 右端向左筛选
+未命中 ID，写固定 Tile slot 和 count。
 
-任务空间为 `B * NL`。每个 LRU Tile 读取 selected bitmap，把未被本轮选择的 ID
-稳定压缩到本 Tile 的固定长度 value slot，并写 count。
+阶段 B：第一次 `SyncAll` 后，每个 batch 的 leader：
 
-### K7 `build_lru_plan_keep_scan`
+1. 从最右 Tile 向左读取候选，仅打包前 `missCount` 项到
+   `candidatePacked[B, K]`；
+2. 以 `hitBitmap` 为初值，把打包候选置 1，单次写出 `selectedBitmap`。
 
-任务空间为 `B * NL`。每个 Tile 独立累加左侧 Tile 的 count，生成最终尾部的正向
-exclusive offset。lane 0 保存 offset，lane 1 保留 count。
+阶段 C：第二次 `SyncAll` 后，`B * NH` 个 fill 任务直接使用全局 miss rank 索引
+`candidatePacked`，同时写 `hit_and_miss` 和 `new_lru[:, :K]`。
 
-### K8 `build_lru_plan_write`
+该设计消除了旧 K4 的 `O(NL²)` 重复扫描、K5 的候选 Tile 区间搜索和
+selected bitmap 原子累加。
 
-任务空间为 `B * (NH + NL)`。前 `NH` 类任务并行复制 `hit_and_miss`，后 `NL` 类
-任务把已紧凑的 keep value 写到 `new_lru[K + offset]`。逻辑区间互不重叠，非 32B
-对齐的头尾由 `DataCopyPad` 精确处理。
+### 5.3 keep_write_fused（原 K6 + K7 + K8）
 
-## 6. Workspace 与复用
+阶段 A：`B * NL` 个任务并行读取 `selectedBitmap`，稳定压缩未选 ID，写固定
+Tile slot 和 count。
+
+阶段 B：第一次 `SyncAll` 后，每个 batch 的 leader 正向扫描 count，在 lane 0
+写 exclusive offset。
+
+阶段 C：第二次 `SyncAll` 后，Tile 任务并行把固定 slot 写到
+`new_lru[K + offset]`。前 `K` 项已由上一个融合 Kernel 写好，不再复制
+`hit_and_miss`。
+
+## 6. Workspace
 
 ```text
 Kp = AlignUp(K, 128)
 Lp = AlignUp(2K, 128)
 Tp = 8 * max(NL, NH)
 Vp = NL * TL
-Mp = 8
+Sp = 8 * AIV
 ```
 
-| Workspace | dtype / Shape | 生命周期 |
+| Workspace | dtype / Shape | 用途 |
 |---|---|---|
-| `hit_bitmap` | float32 `[B, Lp]` | K1 原子构建，K3 读取 |
-| `selected_bitmap` | float32 `[B, Lp]` | K5 原子构建，K6 读取 |
-| `hit_rank` | int32 `[B, Kp]` | K1 局部 rank，K2 全局 rank，K5 读取 |
-| `tile_counts` | int32 `[B, Tp]` | K1/K2、K3-K5、K6-K8 分阶段复用 |
-| `tile_values` | int32 `[B, Vp]` | K3-K5 candidate，K6-K8 keep 复用 |
-| `miss_count` | int32 `[B, Mp]` | K2 写，K5 读 |
+| `hit_bitmap` | int8 `[B, Lp]` | leader 单次构建，candidate 阶段读取 |
+| `selected_bitmap` | int8 `[B, Lp]` | leader 单次构建，keep 阶段读取 |
+| `hit_rank` | int32 `[B, Kp]` | Tile 内 miss rank |
+| `hit_tile_info` | int32 `[B, Tp]` | hit Tile offset/count |
+| `tile_counts` | int32 `[B, Tp]` | candidate/keep 阶段复用 |
+| `tile_values` | int32 `[B, Vp]` | candidate/keep 固定 Tile slot 复用 |
+| `candidate_packed` | int32 `[B, Kp]` | 连续 miss 候选 |
+| `miss_count` | int32 `[B, 8]` | 每行 miss 数 |
+| `hit_sync` | int32 `[Sp]` | 1 个软同步区域 |
+| `candidate_sync` | int32 `[2, Sp]` | 2 个独立软同步区域 |
+| `keep_sync` | int32 `[2, Sp]` | 2 个独立软同步区域 |
 
-bitmap 使用 float32 是因为目标 A2 路径支持 float atomic add。bitmap 只判断
-`0.0f` 和非零值；在输入有效 ID 互不重复的约束下，每个位置最终为 0 或 1。
-
-每个 Tile 计数占一个独立 32B slot：lane 0 存 count/offset，lane 1 始终保留
-count。K4/K7 的每个核心只覆盖自己的 slot，其他核心在扫描期间始终读取 lane 1，
-因此不会读取到被并发改写的 lane 0。
+软同步 GM 区域在 Host 侧初始化为 0，每个区域至少为 `AIV * 32B`。每个 Kernel
+还在 UB 中分配同样大小的同步区。
 
 ## 7. UB 预算
 
-各阶段的主要 UB 元素数：
+Host 分别计算三个融合 Kernel 的 UB 上界，并取最大值：
 
 ```text
-K1: Lp(float) + 2*TH + 8
-K2: TH + Tp + Mp
-K3/K6: Lp(float) + 2*TL + 8
-K4/K7: Tp + 8
-K5: Lp(float) + 3*TH + Vp + Tp + Mp
-K8: max(TL, TH) + 8
+hit:
+  max(2*TH+8, Kp+Tp+8) * 4 + Lp + Sp*4
+
+candidate/fill:
+  max(2*TL+8, Vp+Tp+Kp+8, 3*TH+Kp+16) * 4 + Lp + Sp*4
+
+keep/write:
+  max(2*TL+8, 8*NL+8, TL+8) * 4 + Lp + Sp*4
 ```
 
-K5 为最坏阶段。Host 使用 K5 公式检查动态 UB，并预留 8KB。bitmap 原子 DMA 的
-UB 源单独放在 `TPosition::VECOUT`。
+其中 bitmap 已由 float32 改为 int8。Host 在 UB 上界之外继续预留 8KB。
 
 ## 8. 同步与并发安全
 
-- 8 个 Kernel 在同一 current stream 顺序发射，阶段间依赖由 stream 顺序保证。
-- GM 与 UB 之间只使用 `DataCopyPad`。
-- Kernel 不直接对 GM 使用 Scalar `GetValue/SetValue`；所有标量索引访问都在 UB。
-- K1/K5 使用 `SetAtomicAdd<float>()`，DMA 完成后立即恢复 `SetAtomicNone()`。
-- Kernel 入口显式调用 `SetAtomicNone()`，避免继承异常原子状态。
-- 并行 scan 的 count 保存在独占 32B 槽，写本 Tile、读其他 Tile 的 lane 1。
-- 最终写回的每个任务只写自己的逻辑输出区间。
+- 三个融合 Kernel 在 current stream 顺序发射。
+- Kernel 内所有 block 无条件执行相同数量、相同顺序的 `SyncAll`。
+- 每个软同步点使用独立的、预先清零的 GM 区域。
+- `SyncAll` 位于任务循环之外，不会因某个 block 的任务数量不同而产生死锁。
+- Host 保证 `blockDim <= coreNumAiv`。
+- bitmap 每行只有 leader 写，不再需要 atomic。
+- 每个 Tile 只写自己的固定 value/count slot。
+- 最终输出区间互不重叠。
 
-## 9. 正确性与性能验证
+## 9. 后续核内流水优化
 
-`tests/test_build_lru_plan.py` 包含直接 CPU reference 和本设计的分阶段 CPU 模拟，
-覆盖 `B=1,K=2048`、小 shape、Tile 边界、全 miss、无 miss、非连续输入与错误 dtype。
-所有输出必须逐元素一致，并满足：
+融合正确性和性能基线通过后，再实施：
+
+1. 用 `TQue<VECIN/VECOUT>` 和 `BUFFER_NUM=2` 替换通用 `PIPE_ALL` 串行搬运；
+2. 扫描 leader 对长行采用分块 CopyIn/Scalar/CopyOut 流水；
+3. candidate/keep 尝试 `Gather + Compare + GatherMask` 替换 Scalar 随机索引与压缩；
+4. 对 `1x/2x/4x AIV` 任务波数做 profile，只有每核至少两个任务时启用跨 Tile 双缓冲；
+5. 分别覆盖全 miss、无 miss、80% hit、小 shape 和 `K=2048`。
+
+## 10. 验证要求
+
+必须逐元素满足：
 
 ```text
 new_lru[:, :K] == hit_and_miss
 ```
 
-性能脚本 `tests/benchmark_build_lru_plan.py` 默认使用 `B=1,K=2048`、约 80% hit，
-先做精度检查，再分别报告异步 stream 平均耗时和逐次同步 latency。目标设备上还应
-用 profiler 确认每阶段的 AIV 活跃数、Scalar pipe 占比、GM 带宽和 atomic 开销。
-
-源方案：`二维分Tile并行LRU算子设计方案.pdf`。
+测试包含 CPU reference、三融合阶段 CPU 模拟、随机 shape、Tile 边界、全 miss、
+无 miss、非连续输入和错误 dtype。目标设备还需用 profiler 对比 8-Kernel 与
+3-Kernel 的 launch、SyncAll、Scalar、MTE2/MTE3 和 GM 带宽。
