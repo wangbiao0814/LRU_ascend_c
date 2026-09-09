@@ -173,15 +173,20 @@ def test_staged_algorithm_miss_extremes(all_miss, no_miss):
     torch.testing.assert_close(actual[1], expected[1], rtol=0, atol=0)
 
 
-@pytest.fixture(scope="module")
-def npu_device():
+def is_npu_available():
     if torch_npu is None:
-        pytest.skip("torch_npu is not installed")
-    if not torch.npu.is_available():
-        pytest.skip("NPU is not available")
+        return False
+    try:
+        return torch.npu.is_available()
+    except Exception:
+        return False
 
+
+def load_operator_library():
     try:
         import ascend_kernel  # noqa: F401
+
+        return
     except ImportError:
         project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         pattern = os.path.join(
@@ -189,8 +194,17 @@ def npu_device():
         )
         libraries = glob.glob(pattern)
         if not libraries:
-            pytest.fail("ascend_kernel is not installed and no local library was found")
+            raise ImportError(
+                "ascend_kernel is not installed and no local library was found"
+            )
         torch.ops.load_library(libraries[0])
+
+
+@pytest.fixture(scope="module")
+def npu_device():
+    if not is_npu_available():
+        pytest.skip("NPU is not available")
+    load_operator_library()
     return torch.device("npu:0")
 
 
@@ -250,3 +264,55 @@ def test_rejects_wrong_dtype(npu_device):
         torch.ops.npu.build_lru_plan(
             lru.to(device=npu_device, dtype=torch.int64), hit.to(npu_device)
         )
+
+
+def run_simple_test():
+    """Run exact CPU-vs-NPU checks without invoking the pytest runner."""
+    if not is_npu_available():
+        print("NPU is not available; build_lru_plan device test was not run.")
+        return False
+
+    try:
+        load_operator_library()
+        device = torch.device("npu:0")
+        cases = [
+            (1, 1, 101, False, False),
+            (2, 3, 102, False, False),
+            (2, 129, 103, False, False),
+            (2, 257, 104, False, False),
+            (3, 129, 105, True, False),
+            (3, 129, 106, False, True),
+        ]
+
+        for batch_size, k, seed, all_miss, no_miss in cases:
+            lru, hit = make_inputs(
+                batch_size,
+                k,
+                seed,
+                all_miss=all_miss,
+                no_miss=no_miss,
+            )
+            expected_lru, expected_hit = build_lru_plan_reference(lru, hit)
+            actual_lru, actual_hit = torch.ops.npu.build_lru_plan(
+                lru.to(device), hit.to(device)
+            )
+            torch.testing.assert_close(
+                actual_lru.cpu(), expected_lru, rtol=0, atol=0
+            )
+            torch.testing.assert_close(
+                actual_hit.cpu(), expected_hit, rtol=0, atol=0
+            )
+            print(f"PASS: B={batch_size}, K={k}, all_miss={all_miss}, no_miss={no_miss}")
+
+        print("build_lru_plan correctness test PASSED")
+        return True
+    except Exception as error:
+        print(f"build_lru_plan correctness test FAILED: {error}")
+        import traceback
+
+        traceback.print_exc()
+        return False
+
+
+if __name__ == "__main__":
+    raise SystemExit(0 if run_simple_test() else 1)
