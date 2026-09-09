@@ -152,6 +152,99 @@ def build_lru_plan_staged(lru, hit, tile_length):
     )
 
 
+def make_parallel_tile_length(logical_length, batch_size, core_num):
+    desired_tiles_per_row = (core_num + batch_size - 1) // batch_size
+    tile_length = (logical_length // desired_tiles_per_row // 8) * 8
+    return min(max(tile_length, 8), 256)
+
+
+def build_lru_plan_parallel_staged(lru, hit, hit_tile_length, lru_tile_length):
+    """CPU simulation of the packed-value, fully parallel kernel pipeline."""
+    batch_size, k = hit.shape
+    lru_length = 2 * k
+    output_lru = []
+    output_hit = []
+
+    for batch in range(batch_size):
+        lru_row = lru[batch].tolist()
+        hit_row = hit[batch].tolist()
+
+        hit_bitmap = [0] * lru_length
+        hit_rank = [-1] * k
+        hit_counts = []
+        for start in range(0, k, hit_tile_length):
+            prefix = 0
+            for index in range(start, min(start + hit_tile_length, k)):
+                value = hit_row[index]
+                if value == -1:
+                    hit_rank[index] = prefix
+                    prefix += 1
+                else:
+                    hit_bitmap[value] += 1
+            hit_counts.append(prefix)
+
+        offset = 0
+        for tile, count in enumerate(hit_counts):
+            start = tile * hit_tile_length
+            for index in range(start, min(start + hit_tile_length, k)):
+                if hit_rank[index] >= 0:
+                    hit_rank[index] += offset
+            offset += count
+        miss_count = offset
+
+        candidate_values = []
+        candidate_counts = []
+        for start in range(0, lru_length, lru_tile_length):
+            end = min(start + lru_tile_length, lru_length)
+            values = [
+                lru_row[index]
+                for index in range(end - 1, start - 1, -1)
+                if hit_bitmap[lru_row[index]] == 0
+            ]
+            candidate_values.append(values)
+            candidate_counts.append(len(values))
+
+        candidate_offsets = [0] * len(candidate_counts)
+        offset = 0
+        for tile in range(len(candidate_counts) - 1, -1, -1):
+            candidate_offsets[tile] = offset
+            offset += candidate_counts[tile]
+
+        filled = []
+        selected_bitmap = [0] * lru_length
+        for index, value in enumerate(hit_row):
+            output_value = value
+            if value == -1:
+                rank = hit_rank[index]
+                assert 0 <= rank < miss_count
+                for tile, tile_offset in enumerate(candidate_offsets):
+                    tile_count = candidate_counts[tile]
+                    if tile_offset <= rank < tile_offset + tile_count:
+                        output_value = candidate_values[tile][rank - tile_offset]
+                        break
+            filled.append(output_value)
+            selected_bitmap[output_value] += 1
+
+        keep_values = []
+        for start in range(0, lru_length, lru_tile_length):
+            end = min(start + lru_tile_length, lru_length)
+            keep_values.append(
+                [
+                    lru_row[index]
+                    for index in range(start, end)
+                    if selected_bitmap[lru_row[index]] == 0
+                ]
+            )
+
+        output_hit.append(filled)
+        output_lru.append(filled + [value for tile in keep_values for value in tile])
+
+    return (
+        torch.tensor(output_lru, dtype=torch.int32),
+        torch.tensor(output_hit, dtype=torch.int32),
+    )
+
+
 @pytest.mark.parametrize("k", [1, 3, 127, 128, 129, 257])
 @pytest.mark.parametrize("tile_length", [128, 256])
 def test_staged_algorithm_matches_reference(k, tile_length):
@@ -169,6 +262,41 @@ def test_staged_algorithm_miss_extremes(all_miss, no_miss):
     )
     expected = build_lru_plan_reference(lru, hit)
     actual = build_lru_plan_staged(lru, hit, tile_length=128)
+    torch.testing.assert_close(actual[0], expected[0], rtol=0, atol=0)
+    torch.testing.assert_close(actual[1], expected[1], rtol=0, atol=0)
+
+
+def test_fully_parallel_target_shape_matches_reference():
+    batch_size = 1
+    k = 2048
+    core_num = 40
+    hit_tile_length = make_parallel_tile_length(k, batch_size, core_num)
+    lru_tile_length = make_parallel_tile_length(2 * k, batch_size, core_num)
+    assert hit_tile_length == 48
+    assert lru_tile_length == 96
+    assert (k + hit_tile_length - 1) // hit_tile_length >= core_num
+    assert (2 * k + lru_tile_length - 1) // lru_tile_length >= core_num
+
+    lru, hit = make_inputs(batch_size, k, seed=4096)
+    expected = build_lru_plan_reference(lru, hit)
+    actual = build_lru_plan_parallel_staged(
+        lru, hit, hit_tile_length, lru_tile_length
+    )
+    torch.testing.assert_close(actual[0], expected[0], rtol=0, atol=0)
+    torch.testing.assert_close(actual[1], expected[1], rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("k", [1, 3, 127, 128, 129, 257, 2048])
+def test_fully_parallel_pipeline_random_shapes(k):
+    batch_size = 3
+    core_num = 40
+    hit_tile_length = make_parallel_tile_length(k, batch_size, core_num)
+    lru_tile_length = make_parallel_tile_length(2 * k, batch_size, core_num)
+    lru, hit = make_inputs(batch_size, k, seed=8192 + k)
+    expected = build_lru_plan_reference(lru, hit)
+    actual = build_lru_plan_parallel_staged(
+        lru, hit, hit_tile_length, lru_tile_length
+    )
     torch.testing.assert_close(actual[0], expected[0], rtol=0, atol=0)
     torch.testing.assert_close(actual[1], expected[1], rtol=0, atol=0)
 
@@ -217,6 +345,7 @@ def npu_device():
         (2, 128, 4),
         (4, 129, 5),
         (2, 257, 6),
+        (1, 2048, 7),
     ],
 )
 def test_random_valid_inputs(npu_device, batch_size, k, seed):
