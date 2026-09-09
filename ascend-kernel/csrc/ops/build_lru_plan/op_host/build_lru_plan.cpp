@@ -19,13 +19,9 @@
 #include "tiling/platform/platform_ascendc.h"
 
 #include "aclrtlaunch_build_lru_plan_hit_local.h"
-#include "aclrtlaunch_build_lru_plan_hit_scan.h"
 #include "aclrtlaunch_build_lru_plan_candidate_local.h"
-#include "aclrtlaunch_build_lru_plan_candidate_scan.h"
-#include "aclrtlaunch_build_lru_plan_fill.h"
-#include "aclrtlaunch_build_lru_plan_keep_local.h"
-#include "aclrtlaunch_build_lru_plan_keep_scan.h"
-#include "aclrtlaunch_build_lru_plan_write.h"
+#include "aclrtlaunch_build_lru_plan_materialize.h"
+#include "aclrtlaunch_build_lru_plan_keep_scan_write.h"
 
 namespace ascend_kernel {
 namespace {
@@ -48,8 +44,6 @@ int64_t AlignDown(int64_t value, int64_t alignment)
 int64_t MakeParallelTileLength(int64_t logicalLength, int64_t batchSize,
                                int64_t coreNum)
 {
-    // Produce at least coreNum tasks whenever the logical shape has enough
-    // 32B data blocks. B=1,K=2048 yields TH=48 and TL=96 on a 40-AIV device.
     int64_t desiredTilesPerRow = (coreNum + batchSize - 1) / batchSize;
     int64_t tileLength = AlignDown(
         logicalLength / desiredTilesPerRow, kInt32PerDataBlock);
@@ -66,13 +60,14 @@ uint32_t MakeBlockDim(int64_t taskCount, int64_t coreNum)
 }
 
 int64_t MaximumKernelUbBytes(int64_t lruStride, int64_t hitTileLength,
-                             int64_t tileCountStride, int64_t valueStride,
-                             int64_t missCountStride)
+                             int64_t lruTileLength, int64_t hitMetaStride,
+                             int64_t lruMetaStride, int64_t valueStride)
 {
-    // K5: selected bitmap + hit/rank/output tiles + all candidate tile values
-    // + all candidate (offset,count) slots + one scalar block.
-    int64_t elements = lruStride + 3 * hitTileLength + valueStride +
-                       tileCountStride + missCountStride;
+    // materialize: row bitmap + three tile buffers + compact hit/candidate
+    // metadata + all candidate values + one aligned scalar block.
+    int64_t maxTileLength = std::max(hitTileLength, lruTileLength);
+    int64_t elements = lruStride + 3 * maxTileLength + hitMetaStride +
+                       lruMetaStride + valueStride + kInt32PerDataBlock;
     return elements * static_cast<int64_t>(sizeof(int32_t));
 }
 
@@ -126,85 +121,77 @@ std::tuple<at::Tensor, at::Tensor> build_lru_plan(
     int64_t lruTileCount = (lruLength + lruTileLength - 1) / lruTileLength;
     int64_t hitTileCount = (k + hitTileLength - 1) / hitTileLength;
 
-    // Each count/offset owns a 32B slot. Lane 0 is offset/count and lane 1
-    // preserves the count after the parallel scan stage.
-    int64_t tileCountStride =
-        std::max(lruTileCount, hitTileCount) * kInt32PerDataBlock;
+    // DataCopyPad writes only the requested logical bytes to GM. Counts can
+    // therefore be packed at one int32 per tile; the row stride remains 32B
+    // aligned so consumers can load the complete metadata row efficiently.
+    int64_t hitMetaStride = AlignUp(hitTileCount, kInt32PerDataBlock);
+    int64_t lruMetaStride = AlignUp(lruTileCount, kInt32PerDataBlock);
     int64_t valueStride = lruTileCount * lruTileLength;
-    int64_t missCountStride = kInt32PerDataBlock;
 
     int64_t maximumUbBytes = MaximumKernelUbBytes(
-        lruStride, hitTileLength, tileCountStride,
-        valueStride, missCountStride);
+        lruStride, hitTileLength, lruTileLength, hitMetaStride,
+        lruMetaStride, valueStride);
     TORCH_CHECK(maximumUbBytes + kUbReserveBytes <= ubSizeBytes,
                 "build_lru_plan: K=", k,
                 " requires ", maximumUbBytes,
-                " UB bytes for the fully parallel path, but only ",
+                " UB bytes for the fused path, but only ",
                 ubSizeBytes - kUbReserveBytes, " bytes are available");
 
     TORCH_CHECK(batchSize <= std::numeric_limits<int64_t>::max() / lruStride,
                 "build_lru_plan: bitmap workspace size overflow");
     TORCH_CHECK(batchSize <= std::numeric_limits<int64_t>::max() / valueStride,
                 "build_lru_plan: value workspace size overflow");
-    TORCH_CHECK(batchSize <= std::numeric_limits<int64_t>::max() / tileCountStride,
-                "build_lru_plan: count workspace size overflow");
+    TORCH_CHECK(batchSize <= std::numeric_limits<int64_t>::max() / hitMetaStride,
+                "build_lru_plan: hit metadata workspace size overflow");
+    TORCH_CHECK(batchSize <= std::numeric_limits<int64_t>::max() / lruMetaStride,
+                "build_lru_plan: lru metadata workspace size overflow");
 
     auto bitmapOptions = lruContiguous.options().dtype(at::kFloat);
     at::Tensor hitBitmap = at::zeros({batchSize, lruStride}, bitmapOptions);
-    at::Tensor selectedBitmap = at::zeros({batchSize, lruStride}, bitmapOptions);
     at::Tensor hitRank = at::empty({batchSize, hitStride}, lruContiguous.options());
-    at::Tensor tileCounts = at::empty(
-        {batchSize, tileCountStride}, lruContiguous.options());
-    at::Tensor tileValues = at::empty(
+    at::Tensor hitCounts = at::empty(
+        {batchSize, hitMetaStride}, lruContiguous.options());
+    at::Tensor candidateCounts = at::empty(
+        {batchSize, lruMetaStride}, lruContiguous.options());
+    at::Tensor candidateValues = at::empty(
         {batchSize, valueStride}, lruContiguous.options());
-    at::Tensor missCount = at::empty(
-        {batchSize, missCountStride}, lruContiguous.options());
+    // candidateValues is read while keepValues is written inside materialize;
+    // these workspaces must not alias.
+    at::Tensor keepCounts = at::empty(
+        {batchSize, lruMetaStride}, lruContiguous.options());
+    at::Tensor keepValues = at::empty(
+        {batchSize, valueStride}, lruContiguous.options());
 
     int64_t hitTaskCount = batchSize * hitTileCount;
     int64_t lruTaskCount = batchSize * lruTileCount;
-    int64_t writeTaskCount = batchSize * (hitTileCount + lruTileCount);
+    int64_t materializeTaskCount = batchSize * (hitTileCount + lruTileCount);
     uint32_t hitBlockDim = MakeBlockDim(hitTaskCount, coreNum);
     uint32_t lruBlockDim = MakeBlockDim(lruTaskCount, coreNum);
-    uint32_t writeBlockDim = MakeBlockDim(writeTaskCount, coreNum);
+    uint32_t materializeBlockDim = MakeBlockDim(materializeTaskCount, coreNum);
 
     EXEC_KERNEL_CMD(build_lru_plan_hit_local, hitBlockDim,
-                    hitContiguous, hitBitmap, hitRank, tileCounts,
-                    batchSize, k, lruStride, hitStride, tileCountStride,
+                    hitContiguous, hitBitmap, hitRank, hitCounts,
+                    batchSize, k, lruStride, hitStride, hitMetaStride,
                     hitTileLength, hitTileCount);
 
-    EXEC_KERNEL_CMD(build_lru_plan_hit_scan, hitBlockDim,
-                    hitRank, tileCounts, missCount,
-                    batchSize, k, hitStride, tileCountStride,
-                    missCountStride, hitTileLength, hitTileCount);
-
     EXEC_KERNEL_CMD(build_lru_plan_candidate_local, lruBlockDim,
-                    lruContiguous, hitBitmap, tileValues, tileCounts,
+                    lruContiguous, hitBitmap, candidateValues, candidateCounts,
                     batchSize, lruLength, lruStride, valueStride,
-                    tileCountStride, lruTileLength, lruTileCount);
+                    lruMetaStride, lruTileLength, lruTileCount);
 
-    EXEC_KERNEL_CMD(build_lru_plan_candidate_scan, lruBlockDim,
-                    tileCounts, batchSize, tileCountStride, lruTileCount);
+    EXEC_KERNEL_CMD(build_lru_plan_materialize, materializeBlockDim,
+                    lruContiguous, hitContiguous, hitBitmap, hitRank,
+                    hitCounts, candidateValues, candidateCounts,
+                    keepValues, keepCounts, newLru, hitAndMiss,
+                    batchSize, k, lruLength, lruStride, hitStride,
+                    hitMetaStride, lruMetaStride, valueStride,
+                    hitTileLength, lruTileLength,
+                    hitTileCount, lruTileCount);
 
-    EXEC_KERNEL_CMD(build_lru_plan_fill, hitBlockDim,
-                    hitContiguous, hitRank, tileCounts, tileValues,
-                    missCount, selectedBitmap, hitAndMiss,
-                    batchSize, k, lruStride, hitStride, tileCountStride,
-                    valueStride, missCountStride, lruTileLength,
-                    hitTileLength, lruTileCount, hitTileCount);
-
-    EXEC_KERNEL_CMD(build_lru_plan_keep_local, lruBlockDim,
-                    lruContiguous, selectedBitmap, tileValues, tileCounts,
-                    batchSize, lruLength, lruStride, valueStride,
-                    tileCountStride, lruTileLength, lruTileCount);
-
-    EXEC_KERNEL_CMD(build_lru_plan_keep_scan, lruBlockDim,
-                    tileCounts, batchSize, tileCountStride, lruTileCount);
-
-    EXEC_KERNEL_CMD(build_lru_plan_write, writeBlockDim,
-                    hitAndMiss, tileValues, tileCounts, newLru,
-                    batchSize, k, lruLength, valueStride, tileCountStride,
-                    lruTileLength, hitTileLength,
-                    lruTileCount, hitTileCount);
+    EXEC_KERNEL_CMD(build_lru_plan_keep_scan_write, lruBlockDim,
+                    keepValues, keepCounts, newLru,
+                    batchSize, k, lruLength, valueStride, lruMetaStride,
+                    lruTileLength, lruTileCount);
 
     return std::make_tuple(newLru, hitAndMiss);
 }

@@ -159,7 +159,7 @@ def make_parallel_tile_length(logical_length, batch_size, core_num):
 
 
 def build_lru_plan_parallel_staged(lru, hit, hit_tile_length, lru_tile_length):
-    """CPU simulation of the packed-value, fully parallel kernel pipeline."""
+    """CPU simulation of the fused four-kernel pipeline."""
     batch_size, k = hit.shape
     lru_length = 2 * k
     output_lru = []
@@ -183,14 +183,7 @@ def build_lru_plan_parallel_staged(lru, hit, hit_tile_length, lru_tile_length):
                     hit_bitmap[value] += 1
             hit_counts.append(prefix)
 
-        offset = 0
-        for tile, count in enumerate(hit_counts):
-            start = tile * hit_tile_length
-            for index in range(start, min(start + hit_tile_length, k)):
-                if hit_rank[index] >= 0:
-                    hit_rank[index] += offset
-            offset += count
-        miss_count = offset
+        miss_count = sum(hit_counts)
 
         candidate_values = []
         candidate_counts = []
@@ -204,37 +197,35 @@ def build_lru_plan_parallel_staged(lru, hit, hit_tile_length, lru_tile_length):
             candidate_values.append(values)
             candidate_counts.append(len(values))
 
-        candidate_offsets = [0] * len(candidate_counts)
-        offset = 0
-        for tile in range(len(candidate_counts) - 1, -1, -1):
-            candidate_offsets[tile] = offset
-            offset += candidate_counts[tile]
-
         filled = []
-        selected_bitmap = [0] * lru_length
         for index, value in enumerate(hit_row):
             output_value = value
             if value == -1:
-                rank = hit_rank[index]
+                hit_tile = index // hit_tile_length
+                rank = hit_rank[index] + sum(hit_counts[:hit_tile])
                 assert 0 <= rank < miss_count
-                for tile, tile_offset in enumerate(candidate_offsets):
+                for tile in range(len(candidate_counts) - 1, -1, -1):
                     tile_count = candidate_counts[tile]
-                    if tile_offset <= rank < tile_offset + tile_count:
-                        output_value = candidate_values[tile][rank - tile_offset]
+                    if rank < tile_count:
+                        output_value = candidate_values[tile][rank]
                         break
+                    rank -= tile_count
             filled.append(output_value)
-            selected_bitmap[output_value] += 1
 
         keep_values = []
-        for start in range(0, lru_length, lru_tile_length):
+        for tile, start in enumerate(range(0, lru_length, lru_tile_length)):
             end = min(start + lru_tile_length, lru_length)
-            keep_values.append(
-                [
-                    lru_row[index]
-                    for index in range(start, end)
-                    if selected_bitmap[lru_row[index]] == 0
-                ]
-            )
+            suffix_offset = sum(candidate_counts[tile + 1 :])
+            within_reverse = candidate_counts[tile]
+            tile_keep_values = []
+            for index in range(start, end):
+                value = lru_row[index]
+                if hit_bitmap[value] == 0:
+                    within_reverse -= 1
+                    reverse_rank = suffix_offset + within_reverse
+                    if reverse_rank >= miss_count:
+                        tile_keep_values.append(value)
+            keep_values.append(tile_keep_values)
 
         output_hit.append(filled)
         output_lru.append(filled + [value for tile in keep_values for value in tile])
