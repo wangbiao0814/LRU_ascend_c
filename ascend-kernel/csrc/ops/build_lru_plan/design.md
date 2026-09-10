@@ -135,13 +135,14 @@ K4 keep_scan_write
 因此这里直接使用 `id == -1` 统计 miss，不额外搬入 `hit_mask`。与旧实现相比，删除
 Tile 内 `hit_rank` 的生成和写出。
 
+`hit_bitmap` 由 Host 以零初始化。由于有效 hit ID 在一行内互不重复，每个有效 ID 都有
+唯一写者；K1 使用每 ID 一次 4B `DataCopyPad` 的稀疏短写，删除每 Tile 的整行 bitmap
+初始化、整行搬出和 float atomic add。
+
 ```cpp
-Duplicate(bitmapLocal, 0.0f, lruStride);
 DataCopyPad(hitLocal, hitGm[hitOffset], hitCopyParams, noPad);
 SetFlag<HardEvent::MTE2_S>(mte2ToS);
 WaitFlag<HardEvent::MTE2_S>(mte2ToS);
-SetFlag<HardEvent::V_S>(vToS);
-WaitFlag<HardEvent::V_S>(vToS);
 
 int32_t missCount = 0;
 for (int64_t p = 0; p < validLen; ++p) {
@@ -149,7 +150,7 @@ for (int64_t p = 0; p < validLen; ++p) {
     if (id == -1) {
         ++missCount;
     } else {
-        bitmapLocal.SetValue(id, 1.0f);
+        oneLocal.SetValue(p, 1.0f);
     }
 }
 countLocal.SetValue(0, missCount);
@@ -157,10 +158,17 @@ countLocal.SetValue(0, missCount);
 SetFlag<HardEvent::S_MTE3>(sToMte3);
 WaitFlag<HardEvent::S_MTE3>(sToMte3);
 DataCopyPad(hitCountsGm[countOffset], countLocal, oneInt32Params);
-SetAtomicAdd<float>();
-DataCopyPad(hitBitmapGm[bitmapOffset], bitmapLocal, bitmapCopyParams);
-SetAtomicNone();
+for (int64_t p = 0; p < validLen; ++p) {
+    int32_t id = hitLocal.GetValue(p);
+    if (id != -1) {
+        DataCopyPad(hitBitmapGm[bitmapOffset + id], oneLocal[p], oneInt32Params);
+    }
+}
 ```
+
+普通 `DataCopyPad` 不能用一组参数表达任意 ID 的 scatter，因此这里是每个有效 ID 一次
+短写，而不是整个 Tile 一次写。若 profiler 显示短 DMA 命令开销占主导，后续备选路径是
+按 bitmap 地址范围分配唯一写者，每个任务一次连续写出自己的 range。
 
 ### 4.2 K2 `build_lru_plan_candidate_local`
 
@@ -337,13 +345,13 @@ TL = lruTileLength
 
 | Buffer | dtype | 数量 | 大小（Byte） | 用途 |
 |---|---|---:|---:|---|
-| `bitmapLocal` | float32 | 1 | `4 * lruStride` | 本 Tile 私有 hit bitmap |
 | `hitLocal` | int32 | 1 | `4 * TH` | hit Tile |
+| `oneLocal` | float32 | 1 | `4 * TH` | 稀疏短写的稳定源槽 |
 | `countLocal` | int32 | 1 | `32` | 单个 miss count 的对齐短写 |
-| **总计** | | | **`4*lruStride + 4*TH + 32`** | |
+| **总计** | | | **`8*TH + 32`** | |
 
-Tile buffer coefficient 为 **4 Byte/TH 元素**；相较旧实现删除 `rankLocal`，每核减少
-`4 * TH` Byte UB。
+Tile buffer coefficient 为 **8 Byte/TH 元素**。相较整行 atomic bitmap 方案，K1 UB
+不再随 `lruStride` 增长。
 
 #### K2 UB 分配
 
@@ -404,7 +412,7 @@ max(K1_ub_bytes, K2_ub_bytes, K3_ub_bytes, K4_ub_bytes)
 
 | Kernel | UB 使用量 |
 |---|---:|
-| K1 | `16,608 Byte` |
+| K1 | `416 Byte` |
 | K2 | `17,184 Byte` |
 | K3 | `17,568 Byte` |
 | K4 | `576 Byte` |
@@ -489,8 +497,8 @@ Byte 输出显存。
 
 - K1/K2/K3/K4 在同一 current stream 顺序发射，跨 Kernel 数据依赖由 stream 保证；
 - 同一 Kernel 内不同任务只写独占的 Tile 逻辑区间或独占 metadata 元素；
-- K1 bitmap 通过 `SetAtomicAdd<float>() + DataCopyPad` 汇总，原子搬出后必须立即
-  `SetAtomicNone()`；
+- K1 bitmap 的每个有效 ID 只有一个任务写；并发安全来自地址互斥，`DataCopyPad`
+  本身不提供冲突保护；
 - GM→UB 后 Scalar 首次消费使用 `MTE2_S`，Scalar→GM 前使用 `S_MTE3`，复用同一
   UB 槽前按真实依赖使用 `MTE3_S`；禁止恢复 helper 内无条件 `PIPE_ALL`；
 - K3 必须先完成 `hit` Tile 的 MTE2 搬入和 Scalar 消费，再对相同 GM 区间执行原地

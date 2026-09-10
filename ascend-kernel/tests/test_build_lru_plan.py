@@ -165,6 +165,31 @@ def make_parallel_tile_length(logical_length, batch_size, core_num):
     return min(max(tile_length, 8), 256)
 
 
+def build_hit_bitmap_sparse(hit, tile_length):
+    """Simulate K1's non-atomic 4-byte stores and verify address ownership."""
+    batch_size, k = hit.shape
+    lru_length = 2 * k
+    bitmaps = []
+    counts = []
+    for batch in range(batch_size):
+        bitmap = [0] * lru_length
+        written_ids = set()
+        row_counts = []
+        for start in range(0, k, tile_length):
+            miss_count = 0
+            for value in hit[batch, start : start + tile_length].tolist():
+                if value == -1:
+                    miss_count += 1
+                else:
+                    assert value not in written_ids
+                    written_ids.add(value)
+                    bitmap[value] = 1
+            row_counts.append(miss_count)
+        bitmaps.append(bitmap)
+        counts.append(row_counts)
+    return bitmaps, counts
+
+
 def build_lru_plan_parallel_staged(
     lru, hit, hit_mask, hit_tile_length, lru_tile_length
 ):
@@ -287,6 +312,18 @@ def test_fully_parallel_target_shape_matches_reference():
     )
     torch.testing.assert_close(actual[0], expected[0], rtol=0, atol=0)
     torch.testing.assert_close(actual[1], expected[1], rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("k", [1, 3, 31, 32, 127, 2048])
+@pytest.mark.parametrize("tile_length", [16, 32, 48])
+def test_sparse_hit_bitmap_has_disjoint_stores(k, tile_length):
+    lru, hit = make_inputs(3, k, seed=16384 + k + tile_length)
+    bitmaps, counts = build_hit_bitmap_sparse(hit, tile_length)
+    for batch in range(hit.size(0)):
+        expected_ids = {value for value in hit[batch].tolist() if value != -1}
+        actual_ids = {index for index, value in enumerate(bitmaps[batch]) if value}
+        assert actual_ids == expected_ids
+        assert sum(counts[batch]) == k - len(expected_ids)
 
 
 @pytest.mark.parametrize("k", [1, 3, 127, 128, 129, 257, 2048])

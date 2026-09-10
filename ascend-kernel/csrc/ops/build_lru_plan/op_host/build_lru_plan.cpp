@@ -70,8 +70,8 @@ int64_t MaximumKernelUbBytes(int64_t lruStride, int64_t hitTileLength,
                             static_cast<int64_t>(sizeof(int32_t));
     int64_t maskTileBytes = AlignUp(hitTileLength, 32);
 
-    int64_t hitLocalBytes = lruStride * static_cast<int64_t>(sizeof(float)) +
-                            hitTileLength * static_cast<int64_t>(sizeof(int32_t)) +
+    int64_t hitLocalBytes = 2 * hitTileLength *
+                                static_cast<int64_t>(sizeof(int32_t)) +
                             scalarBlockBytes;
     int64_t candidateLocalBytes = lruStride * static_cast<int64_t>(sizeof(float)) +
                                   2 * lruTileLength *

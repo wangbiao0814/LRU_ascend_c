@@ -78,19 +78,17 @@ __aicore__ inline void CopyOutInt32(GlobalTensor<int32_t> &dst,
     DataCopyPad(dst[dstOffset], src, params);
 }
 
-__aicore__ inline void CopyOutFloatAtomic(GlobalTensor<float> &dst,
-                                          int64_t dstOffset,
-                                          LocalTensor<float> src,
-                                          int64_t length)
+__aicore__ inline void CopyOutFloat(GlobalTensor<float> &dst,
+                                    int64_t dstOffset,
+                                    LocalTensor<float> src,
+                                    int64_t length)
 {
     DataCopyExtParams params{};
     params.blockCount = 1;
     params.blockLen = static_cast<uint32_t>(length * sizeof(float));
     params.srcStride = 0;
     params.dstStride = 0;
-    SetAtomicAdd<float>();
     DataCopyPad(dst[dstOffset], src, params);
-    SetAtomicNone();
 }
 
 __aicore__ inline void WaitMte2ToScalar()
@@ -99,14 +97,6 @@ __aicore__ inline void WaitMte2ToScalar()
         GetTPipePtr()->FetchEventID(HardEvent::MTE2_S));
     SetFlag<HardEvent::MTE2_S>(eventId);
     WaitFlag<HardEvent::MTE2_S>(eventId);
-}
-
-__aicore__ inline void WaitVectorToScalar()
-{
-    event_t eventId = static_cast<event_t>(
-        GetTPipePtr()->FetchEventID(HardEvent::V_S));
-    SetFlag<HardEvent::V_S>(eventId);
-    WaitFlag<HardEvent::V_S>(eventId);
 }
 
 __aicore__ inline void WaitScalarToMte3()
@@ -145,16 +135,13 @@ extern "C" __global__ __aicore__ void build_lru_plan_hit_local(
 
     TPipe pipe;
     TBuf<TPosition::VECCALC> workBuf;
-    TBuf<TPosition::VECOUT> bitmapBuf;
     pipe.InitBuffer(workBuf,
-                    static_cast<uint32_t>((hitTileLength +
+                    static_cast<uint32_t>((2 * hitTileLength +
                                            kDataBlockElements) * sizeof(int32_t)));
-    pipe.InitBuffer(bitmapBuf,
-                    static_cast<uint32_t>(lruStride * sizeof(float)));
     LocalTensor<int32_t> work = workBuf.Get<int32_t>();
     LocalTensor<int32_t> hitLocal = work;
-    LocalTensor<int32_t> countLocal = work[hitTileLength];
-    LocalTensor<float> bitmapLocal = bitmapBuf.Get<float>();
+    LocalTensor<float> oneLocal = work[hitTileLength].ReinterpretCast<float>();
+    LocalTensor<int32_t> countLocal = work[2 * hitTileLength];
 
     int64_t taskCount = batchSize * hitTileCount;
     int64_t blockNum = GetBlockNum();
@@ -164,10 +151,8 @@ extern "C" __global__ __aicore__ void build_lru_plan_hit_local(
         int64_t start = ht * hitTileLength;
         int64_t validLen = MinInt64(hitTileLength, k - start);
 
-        Duplicate(bitmapLocal, 0.0f, lruStride);
         CopyInInt32(hitLocal, hitGm, b * k + start, validLen);
         WaitMte2ToScalar();
-        WaitVectorToScalar();
 
         int32_t prefix = 0;
         for (int64_t p = 0; p < validLen; ++p) {
@@ -175,7 +160,7 @@ extern "C" __global__ __aicore__ void build_lru_plan_hit_local(
             if (id == -1) {
                 ++prefix;
             } else {
-                bitmapLocal.SetValue(id, 1.0f);
+                oneLocal.SetValue(p, 1.0f);
             }
         }
         countLocal.SetValue(0, prefix);
@@ -183,8 +168,17 @@ extern "C" __global__ __aicore__ void build_lru_plan_hit_local(
         WaitScalarToMte3();
         CopyOutInt32(hitCountsGm, b * hitMetaStride + ht,
                      countLocal, 1);
-        CopyOutFloatAtomic(bitmapGm, b * lruStride,
-                           bitmapLocal, lruStride);
+        // Valid hit IDs are unique within each row by contract. Every sparse
+        // store therefore owns a distinct logical float in hitBitmap, even
+        // when different hit tiles execute concurrently. DataCopyPad writes
+        // only the requested four bytes, so no atomic merge is required.
+        for (int64_t p = 0; p < validLen; ++p) {
+            int32_t id = hitLocal.GetValue(p);
+            if (id != -1) {
+                CopyOutFloat(bitmapGm, b * lruStride + id,
+                             oneLocal[p], 1);
+            }
+        }
         WaitMte3ToScalar();
     }
 }
