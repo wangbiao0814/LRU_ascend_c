@@ -165,6 +165,28 @@ def make_parallel_tile_length(logical_length, batch_size, core_num):
     return min(max(tile_length, 8), 256)
 
 
+def build_hit_row_local(hit, hit_tile_length):
+    """CPU model of the row-owned K1 bitmap/count construction."""
+    batch_size, k = hit.shape
+    lru_length = 2 * k
+    bitmaps = []
+    counts = []
+    for batch in range(batch_size):
+        bitmap = [0] * lru_length
+        row_counts = []
+        for start in range(0, k, hit_tile_length):
+            miss_count = 0
+            for value in hit[batch, start : start + hit_tile_length].tolist():
+                if value == -1:
+                    miss_count += 1
+                else:
+                    bitmap[value] = 1
+            row_counts.append(miss_count)
+        bitmaps.append(bitmap)
+        counts.append(row_counts)
+    return bitmaps, counts
+
+
 def build_hit_bitmap_sparse(hit, tile_length):
     """Simulate K1's non-atomic 4-byte stores and verify address ownership."""
     batch_size, k = hit.shape
@@ -312,6 +334,19 @@ def test_fully_parallel_target_shape_matches_reference():
     )
     torch.testing.assert_close(actual[0], expected[0], rtol=0, atol=0)
     torch.testing.assert_close(actual[1], expected[1], rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("batch_size", [1, 16, 41])
+@pytest.mark.parametrize("k", [1, 3, 127, 2048])
+def test_row_owned_hit_bitmap_and_counts(batch_size, k):
+    _, hit = make_inputs(batch_size, k, seed=12288 + batch_size + k)
+    tile_length = make_parallel_tile_length(k, batch_size, core_num=40)
+    bitmaps, counts = build_hit_row_local(hit, tile_length)
+    for batch in range(batch_size):
+        expected_hits = {value for value in hit[batch].tolist() if value != -1}
+        actual_hits = {index for index, value in enumerate(bitmaps[batch]) if value}
+        assert actual_hits == expected_hits
+        assert sum(counts[batch]) == k - len(expected_hits)
 
 
 @pytest.mark.parametrize("k", [1, 3, 31, 32, 127, 2048])

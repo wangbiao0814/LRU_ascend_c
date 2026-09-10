@@ -131,51 +131,45 @@ K4 keep_scan_write
 
 ### 4.1 K1 `build_lru_plan_hit_local`
 
-任务空间为 `B * NH`。K1 必须读取 `hit` 才能为有效 ID 构造按 ID 索引的 bitmap，
-因此这里直接使用 `id == -1` 统计 miss，不额外搬入 `hit_mask`。与旧实现相比，删除
-Tile 内 `hit_rank` 的生成和写出。
+任务空间为 `B`，每个任务独占一整行。K1 一次搬入整行 `hit`，在 UB 内构造完整
+`hit_bitmap` 和全部 `hit_counts`，然后各进行一次连续搬出。不同任务写不同 batch 行，
+因此不需要 float atomic add。Host 使用 `empty` 分配 bitmap，K1 完整覆盖包含 padding
+在内的 `lruStride`。
 
-`hit_bitmap` 由 Host 以零初始化。由于有效 hit ID 在一行内互不重复，每个有效 ID 都有
-唯一写者；K1 使用每 ID 一次 4B `DataCopyPad` 的稀疏短写，删除每 Tile 的整行 bitmap
-初始化、整行搬出和 float atomic add。
+K1 直接使用 `id == -1` 统计每个原始 Hit Tile 的 miss，不额外搬入 `hit_mask`，也不再
+生成 `hit_rank`。
 
 ```cpp
-Duplicate(oneLocal, 1.0f, 8);  // 初始化完整、32B 对齐的只读源块
-SetFlag<HardEvent::V_MTE3>(vToMte3);
-WaitFlag<HardEvent::V_MTE3>(vToMte3);
-
-DataCopyPad(hitLocal, hitGm[hitOffset], hitCopyParams, noPad);
+Duplicate(bitmapLocal, 0.0f, lruStride);
+Duplicate(countLocal, 0, hitMetaStride);
+DataCopyPad(hitLocal, hitGm[rowOffset], wholeRowParams, noPad);
 SetFlag<HardEvent::MTE2_S>(mte2ToS);
 WaitFlag<HardEvent::MTE2_S>(mte2ToS);
+SetFlag<HardEvent::V_S>(vToS);
+WaitFlag<HardEvent::V_S>(vToS);
 
-int32_t missCount = 0;
-for (int64_t p = 0; p < validLen; ++p) {
-    int32_t id = hitLocal.GetValue(p);
-    if (id == -1) {
-        ++missCount;
+for (int64_t ht = 0; ht < hitTileCount; ++ht) {
+    int32_t missCount = 0;
+    for (int64_t p = tileBegin(ht); p < tileEnd(ht); ++p) {
+        int32_t id = hitLocal.GetValue(p);
+        if (id == -1) {
+            ++missCount;
+        } else {
+            bitmapLocal.SetValue(id, 1.0f);
+        }
     }
+    countLocal.SetValue(ht, missCount);
 }
-countLocal.SetValue(0, missCount);
 
 SetFlag<HardEvent::S_MTE3>(sToMte3);
 WaitFlag<HardEvent::S_MTE3>(sToMte3);
-DataCopyPad(hitCountsGm[countOffset], countLocal, oneInt32Params);
-for (int64_t p = 0; p < validLen; ++p) {
-    int32_t id = hitLocal.GetValue(p);
-    if (id != -1) {
-        DataCopyPad(hitBitmapGm[bitmapOffset + id], oneLocal, oneFloatParams);
-    }
-}
+DataCopyPad(hitBitmapGm[bitmapOffset], bitmapLocal, bitmapRowParams);
+DataCopyPad(hitCountsGm[countOffset], countLocal, countRowParams);
 ```
 
-所有稀疏短写共享同一个只读 `oneLocal`。Kernel 开始时用 `Duplicate` 将完整 32B
-源块显式初始化为 `1.0f`，并通过 `V_MTE3` event 保证初始化对 MTE3 可见。该源块
-起点必须 32B 对齐，不能使用 `oneLocal[p]`，否则 `p` 非 8 的倍数时 MTE3 的 UB
-源地址未对齐，会触发 `instruction address misalign`。
-
-普通 `DataCopyPad` 不能用一组参数表达任意 ID 的 scatter，因此这里是每个有效 ID 一次
-短写，而不是整个 Tile 一次写。若 profiler 显示短 DMA 命令开销占主导，后续备选路径是
-按 bitmap 地址范围分配唯一写者，每个任务一次连续写出自己的 range。
+这个行独占方案避免了两种低效路径：每 Hit Tile 全量 atomic bitmap，以及每有效 ID
+一次 4B 随机短 DMA。代价是 K1 的最大并行度为 `min(B, C)`；对 `B=16` 已有 16 个
+并行任务，连续 DMA 和较低的指令数优先于进一步切分。
 
 ### 4.2 K2 `build_lru_plan_candidate_local`
 
@@ -335,7 +329,8 @@ TH = 48, NH = 43
 TL = 96, NL = 43
 ```
 
-因此四个阶段均至少有 40 个有效任务。
+K2/K3/K4 至少有 40 个有效任务。K1 使用行独占任务，`blockDim=min(B,C)`；重点场景
+`B=1` 使用一个 K1 Core，`B=16` 使用 16 个 K1 Core。
 
 ### 5.3 UB 级：容量约束与 Buffer 分配
 
@@ -352,13 +347,13 @@ TL = lruTileLength
 
 | Buffer | dtype | 数量 | 大小（Byte） | 用途 |
 |---|---|---:|---:|---|
-| `hitLocal` | int32 | 1 | `4 * TH` | hit Tile |
-| `oneLocal` | float32 | 1 | `32` | 稀疏短写共享的对齐只读源块 |
-| `countLocal` | int32 | 1 | `32` | 单个 miss count 的对齐短写 |
-| **总计** | | | **`4*TH + 64`** | |
+| `bitmapLocal` | float32 | 1 | `4 * lruStride` | 完整行 bitmap |
+| `hitLocal` | int32 | 1 | `4 * A8(K)` | 完整 hit 行 |
+| `countLocal` | int32 | 1 | `4 * hitMetaStride` | 全部 Hit Tile count |
+| **总计** | | | **`4*(lruStride+A8(K)+hitMetaStride)`** | |
 
-Tile buffer coefficient 为 **4 Byte/TH 元素**，另有 64B 对齐标量区。相较整行 atomic bitmap 方案，K1 UB
-不再随 `lruStride` 增长。
+三个区域的起点均按 32B 对齐。K1 UB 随行宽增长，由 Host 与其他 Kernel 一起进行容量
+上界检查。
 
 #### K2 UB 分配
 
@@ -419,12 +414,12 @@ max(K1_ub_bytes, K2_ub_bytes, K3_ub_bytes, K4_ub_bytes)
 
 | Kernel | UB 使用量 |
 |---|---:|
-| K1 | `256 Byte` |
+| K1 | `24,768 Byte` |
 | K2 | `17,184 Byte` |
 | K3 | `17,568 Byte` |
 | K4 | `576 Byte` |
 
-最大值约占示例 192KB UB 的 `8.94%`；再加 8KB reserve 仍满足约束。实际实现必须读取
+最大值约占示例 192KB UB 的 `12.60%`；再加 8KB reserve 仍满足约束。实际实现必须读取
 运行设备 UB 容量，不能把 192KB 写死。
 
 初版 `pipelineDepth=1`。只有 profiler 显示 MTE stall，且每核稳定获得至少 3 个 Tile
@@ -467,6 +462,18 @@ PyTorch 生命周期管理。
 
 ## 7. MTE 流量收益分析
 
+K1 的 bitmap 构造流量与指令数单独计算：
+
+| K1 路径 | bitmap 逻辑写量 | bitmap MTE3 指令数 |
+|---|---:|---:|
+| 每 Hit Tile 全量 atomic | `4*B*NH*lruStride` | `B*NH` |
+| 每有效 ID 稀疏短写 | `4*validHitCount` | `validHitCount` |
+| 当前行独占路径 | `4*B*lruStride` | `B` |
+
+当前路径选择连续写量与低指令数之间的平衡，尤其避免大 batch、高 hit rate 下数万次
+4B 随机 `DataCopyPad`。另外 K1 完整覆盖 bitmap，因此 Host 使用 `empty` 而不是预先
+`zeros`，不额外产生一次全局清零。
+
 只统计受本次接口变更影响、按逻辑有效字节计算的 GM 流量：
 
 | 路径 | 旧 V2 | 新设计 |
@@ -504,8 +511,7 @@ Byte 输出显存。
 
 - K1/K2/K3/K4 在同一 current stream 顺序发射，跨 Kernel 数据依赖由 stream 保证；
 - 同一 Kernel 内不同任务只写独占的 Tile 逻辑区间或独占 metadata 元素；
-- K1 bitmap 的每个有效 ID 只有一个任务写；并发安全来自地址互斥，`DataCopyPad`
-  本身不提供冲突保护；
+- K1 每个 batch 行只有一个任务写，bitmap 和 count 均完整连续覆盖，不使用 atomic；
 - GM→UB 后 Scalar 首次消费使用 `MTE2_S`，Scalar→GM 前使用 `S_MTE3`，复用同一
   UB 槽前按真实依赖使用 `MTE3_S`；禁止恢复 helper 内无条件 `PIPE_ALL`；
 - K3 必须先完成 `hit` Tile 的 MTE2 搬入和 Scalar 消费，再对相同 GM 区间执行原地

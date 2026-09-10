@@ -60,7 +60,8 @@ uint32_t MakeBlockDim(int64_t taskCount, int64_t coreNum)
     return static_cast<uint32_t>(usedCoreNum);
 }
 
-int64_t MaximumKernelUbBytes(int64_t lruStride, int64_t hitTileLength,
+int64_t MaximumKernelUbBytes(int64_t k, int64_t lruStride,
+                             int64_t hitTileLength,
                              int64_t lruTileLength, int64_t hitMetaStride,
                              int64_t lruMetaStride, int64_t valueStride)
 {
@@ -70,9 +71,9 @@ int64_t MaximumKernelUbBytes(int64_t lruStride, int64_t hitTileLength,
                             static_cast<int64_t>(sizeof(int32_t));
     int64_t maskTileBytes = AlignUp(hitTileLength, 32);
 
-    int64_t hitLocalBytes = hitTileLength *
-                                static_cast<int64_t>(sizeof(int32_t)) +
-                            2 * scalarBlockBytes;
+    int64_t hitLocalStride = AlignUp(k, kInt32PerDataBlock);
+    int64_t hitLocalBytes = (lruStride + hitLocalStride + hitMetaStride) *
+                            static_cast<int64_t>(sizeof(int32_t));
     int64_t candidateLocalBytes = lruStride * static_cast<int64_t>(sizeof(float)) +
                                   2 * lruTileLength *
                                       static_cast<int64_t>(sizeof(int32_t)) +
@@ -169,7 +170,7 @@ at::Tensor build_lru_plan(const at::Tensor &lru, at::Tensor &hit,
     int64_t valueStride = lruTileCount * lruTileLength;
 
     int64_t maximumUbBytes = MaximumKernelUbBytes(
-        lruStride, hitTileLength, lruTileLength, hitMetaStride,
+        k, lruStride, hitTileLength, lruTileLength, hitMetaStride,
         lruMetaStride, valueStride);
     TORCH_CHECK(maximumUbBytes + kUbReserveBytes <= ubSizeBytes,
                 "build_lru_plan: K=", k,
@@ -187,7 +188,7 @@ at::Tensor build_lru_plan(const at::Tensor &lru, at::Tensor &hit,
                 "build_lru_plan: lru metadata workspace size overflow");
 
     auto bitmapOptions = lruContiguous.options().dtype(at::kFloat);
-    at::Tensor hitBitmap = at::zeros({batchSize, lruStride}, bitmapOptions);
+    at::Tensor hitBitmap = at::empty({batchSize, lruStride}, bitmapOptions);
     at::Tensor hitCounts = at::empty(
         {batchSize, hitMetaStride}, lruContiguous.options());
     at::Tensor candidateCounts = at::empty(
@@ -201,7 +202,7 @@ at::Tensor build_lru_plan(const at::Tensor &lru, at::Tensor &hit,
     at::Tensor keepValues = at::empty(
         {batchSize, valueStride}, lruContiguous.options());
 
-    int64_t hitTaskCount = batchSize * hitTileCount;
+    int64_t hitTaskCount = batchSize;
     int64_t lruTaskCount = batchSize * lruTileCount;
     int64_t materializeTaskCount = batchSize * (hitTileCount + lruTileCount);
     uint32_t hitBlockDim = MakeBlockDim(hitTaskCount, coreNum);

@@ -99,20 +99,20 @@ __aicore__ inline void WaitMte2ToScalar()
     WaitFlag<HardEvent::MTE2_S>(eventId);
 }
 
+__aicore__ inline void WaitVectorToScalar()
+{
+    event_t eventId = static_cast<event_t>(
+        GetTPipePtr()->FetchEventID(HardEvent::V_S));
+    SetFlag<HardEvent::V_S>(eventId);
+    WaitFlag<HardEvent::V_S>(eventId);
+}
+
 __aicore__ inline void WaitScalarToMte3()
 {
     event_t eventId = static_cast<event_t>(
         GetTPipePtr()->FetchEventID(HardEvent::S_MTE3));
     SetFlag<HardEvent::S_MTE3>(eventId);
     WaitFlag<HardEvent::S_MTE3>(eventId);
-}
-
-__aicore__ inline void WaitVectorToMte3()
-{
-    event_t eventId = static_cast<event_t>(
-        GetTPipePtr()->FetchEventID(HardEvent::V_MTE3));
-    SetFlag<HardEvent::V_MTE3>(eventId);
-    WaitFlag<HardEvent::V_MTE3>(eventId);
 }
 
 __aicore__ inline void WaitMte3ToScalar()
@@ -125,7 +125,7 @@ __aicore__ inline void WaitMte3ToScalar()
 
 }  // namespace
 
-// Stage 1: build the hit bitmap, tile-local miss ranks, and compact counts.
+// Stage 1: one task per row builds the complete bitmap and all tile counts.
 extern "C" __global__ __aicore__ void build_lru_plan_hit_local(
     GM_ADDR hit, GM_ADDR hitBitmap, GM_ADDR hitCounts,
     int64_t batchSize, int64_t k, int64_t lruStride,
@@ -143,54 +143,45 @@ extern "C" __global__ __aicore__ void build_lru_plan_hit_local(
 
     TPipe pipe;
     TBuf<TPosition::VECCALC> workBuf;
+    int64_t hitLocalStride =
+        (k + kDataBlockElements - 1) / kDataBlockElements *
+        kDataBlockElements;
+    int64_t workElements = lruStride + hitLocalStride + hitMetaStride;
     pipe.InitBuffer(workBuf,
-                    static_cast<uint32_t>((hitTileLength + 2 *
-                                           kDataBlockElements) * sizeof(int32_t)));
+                    static_cast<uint32_t>(workElements * sizeof(int32_t)));
     LocalTensor<int32_t> work = workBuf.Get<int32_t>();
-    LocalTensor<int32_t> hitLocal = work;
-    LocalTensor<float> oneLocal = work[hitTileLength].ReinterpretCast<float>();
-    LocalTensor<int32_t> countLocal =
-        work[hitTileLength + kDataBlockElements];
+    LocalTensor<float> bitmapLocal = work.ReinterpretCast<float>();
+    LocalTensor<int32_t> hitLocal = work[lruStride];
+    LocalTensor<int32_t> countLocal = work[lruStride + hitLocalStride];
 
-    // Initialize one complete 32B data block. All sparse MTE3 stores reuse
-    // this immutable, aligned source block.
-    Duplicate(oneLocal, 1.0f, kDataBlockElements);
-    WaitVectorToMte3();
-
-    int64_t taskCount = batchSize * hitTileCount;
+    int64_t taskCount = batchSize;
     int64_t blockNum = GetBlockNum();
-    for (int64_t task = GetBlockIdx(); task < taskCount; task += blockNum) {
-        int64_t b = task / hitTileCount;
-        int64_t ht = task - b * hitTileCount;
-        int64_t start = ht * hitTileLength;
-        int64_t validLen = MinInt64(hitTileLength, k - start);
-
-        CopyInInt32(hitLocal, hitGm, b * k + start, validLen);
+    for (int64_t b = GetBlockIdx(); b < taskCount; b += blockNum) {
+        Duplicate(bitmapLocal, 0.0f, lruStride);
+        Duplicate(countLocal, static_cast<int32_t>(0), hitMetaStride);
+        CopyInInt32(hitLocal, hitGm, b * k, k);
         WaitMte2ToScalar();
+        WaitVectorToScalar();
 
-        int32_t prefix = 0;
-        for (int64_t p = 0; p < validLen; ++p) {
-            int32_t id = hitLocal.GetValue(p);
-            if (id == -1) {
-                ++prefix;
+        for (int64_t ht = 0; ht < hitTileCount; ++ht) {
+            int64_t start = ht * hitTileLength;
+            int64_t validLen = MinInt64(hitTileLength, k - start);
+            int32_t missCount = 0;
+            for (int64_t p = 0; p < validLen; ++p) {
+                int32_t id = hitLocal.GetValue(start + p);
+                if (id == -1) {
+                    ++missCount;
+                } else {
+                    bitmapLocal.SetValue(id, 1.0f);
+                }
             }
+            countLocal.SetValue(ht, missCount);
         }
-        countLocal.SetValue(0, prefix);
 
         WaitScalarToMte3();
-        CopyOutInt32(hitCountsGm, b * hitMetaStride + ht,
-                     countLocal, 1);
-        // Valid hit IDs are unique within each row by contract. Every sparse
-        // store therefore owns a distinct logical float in hitBitmap, even
-        // when different hit tiles execute concurrently. DataCopyPad writes
-        // only the requested four bytes, so no atomic merge is required.
-        for (int64_t p = 0; p < validLen; ++p) {
-            int32_t id = hitLocal.GetValue(p);
-            if (id != -1) {
-                CopyOutFloat(bitmapGm, b * lruStride + id,
-                             oneLocal, 1);
-            }
-        }
+        CopyOutFloat(bitmapGm, b * lruStride, bitmapLocal, lruStride);
+        CopyOutInt32(hitCountsGm, b * hitMetaStride,
+                     countLocal, hitMetaStride);
         WaitMte3ToScalar();
     }
 }
