@@ -180,6 +180,7 @@ at::Tensor build_lru_plan(const at::Tensor &lru, at::Tensor &hit,
                         hitElements, lruElements);
         return newLru;
     }
+    print("not enough ubs")
 
     // Capacity fallback: preserve the existing tile-parallel implementation
     // for K values whose complete row does not fit in UB.
