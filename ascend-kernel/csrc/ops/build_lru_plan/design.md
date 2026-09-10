@@ -36,13 +36,13 @@ row-fused 快速路径具有以下结果：
 
 - Kernel launch 从 4 次降为 1 次；
 - 删除所有阶段间 bitmap/candidate/count/keep workspace；
-- bitmap 不再需要 atomic，可从 `float32[2K]` 改为 UB 内 `int16[2K]`；
+- hit、lru、candidate、bitmap 和 new_lru 统一为 `int16`，减少 GM/UB 搬运量；
 - 每个输入对象整行只读取一次；
 - 每个输出对象最终只连续写回一次；
 - Block 级并行度为 `min(B,C)`，`B=1` 时只使用一个 AIV，这是减少冗余访存的明确权衡。
 
-对整行数据无法装入 UB 的超大 K，Host 应选择保留的旧 tiled 路径；若项目只支持固定
-小 K，则可以不保留 fallback，但必须明确报错，不能越界分配 UB。
+整行数据无法装入 UB 时 Host 明确报错，不能越界分配 UB。由于 ID 范围为
+`0..2K-1`，有符号 int16 还要求 `K<=16384`。
 
 实现路径为纯 **AscendC Vector Kernel**。本算子没有 PyTorch/NumPy 同名标准接口，继续
 采用项目自定义的 `hit` 原地更新语义。
@@ -77,20 +77,20 @@ new_lru = torch.ops.npu.build_lru_plan(lru, hit, hit_mask)
 
 | 名称 | 方向 | Shape | dtype | 说明 |
 |---|---|---:|---|---|
-| `lru` | 输入 | `[B, 2K]` | `int32` | 每行按 MRU 到 LRU 排列 |
-| `hit` | 输入/原地输出 | `[B, K]` | `int32` | 输入 `-1` 表示 miss，输出时已回填 |
+| `lru` | 输入 | `[B, 2K]` | `int16` | 每行按 MRU 到 LRU 排列 |
+| `hit` | 输入/原地输出 | `[B, K]` | `int16` | 输入 `-1` 表示 miss，输出时已回填 |
 | `hit_mask` | 输入 | `[B, K]` | `bool` | 调用前 `hit != -1` 的掩码 |
-| `new_lru` | 输出 | `[B, 2K]` | `int32` | 更新后的 LRU |
+| `new_lru` | 输出 | `[B, 2K]` | `int16` | 更新后的 LRU |
 
 Host 必须检查：
 
 - 三个 Tensor 位于同一 NPU device；
-- `lru`、`hit` 为 `int32`，`hit_mask` 为 `bool`；
+- `lru`、`hit` 为 `int16`，`hit_mask` 为 `bool`；
 - 三者均为 rank 2，`B>0`、`K>0`，shape 分别为 `[B,2K]`、`[B,K]`、`[B,K]`；
 - `hit` 必须连续，且不与 `lru`、`hit_mask` 存储重叠；
 - `lru`、`hit_mask` 可由 Host 转连续，但性能路径要求调用方直接提供连续 Tensor；
-- `K <= INT32_MAX/2`，所有 shape、offset、UB 字节数计算均检查 int64 溢出；
-- row-fused 路径满足第 5 节 UB 容量约束，否则进入 tiled fallback 或明确报错。
+- `K <= 16384`，确保最大 ID `2K-1` 可由 int16 表示；
+- row-fused 路径满足第 5 节 UB 容量约束，否则明确报错。
 
 性能路径不做 NPU→CPU 值域同步。调用方保证：
 
@@ -100,7 +100,8 @@ lru[b] 是 0..2K-1 的排列
 有效 hit ID 位于 0..2K-1，且行内互不重复
 ```
 
-本算子仅涉及 int32/bool 搬运、比较和索引，不涉及 FP16/BF16，也不需要升精度 Cast。
+本算子仅涉及 int16/bool 搬运、比较和索引；循环计数和 UB 下标使用 int64/int32。
+它不涉及 FP16/BF16，也不需要升精度 Cast。
 
 ---
 
@@ -157,11 +158,11 @@ for (int64_t b = GetBlockIdx(); b < batchSize; b += GetBlockNum()) {
 Duplicate(bitmapLocal, static_cast<int16_t>(0), bitmapElements);
 
 DataCopyPad(hitLocal, hitGm[b * K],
-            K * sizeof(int32_t), noPad);
+            K * sizeof(int16_t), noPad);
 DataCopyPad(maskLocal, hitMaskGm[b * K],
             K * sizeof(uint8_t), noPad);
 DataCopyPad(lruLocal, lruGm[b * 2 * K],
-            2 * K * sizeof(int32_t), noPad);
+            2 * K * sizeof(int16_t), noPad);
 
 WaitMte2ToScalar();
 WaitVectorToScalar();
@@ -176,7 +177,7 @@ uint8，是因为 Ascend A2/A3 的基础 `Duplicate` 不支持 uint8 operand。
 ```cpp
 for (int64_t i = 0; i < K; ++i) {
     if (maskLocal.GetValue(i) != 0) {
-        int32_t id = hitLocal.GetValue(i);
+        int16_t id = hitLocal.GetValue(i);
         bitmapLocal.SetValue(id, static_cast<int16_t>(1));
     }
 }
@@ -187,9 +188,9 @@ for (int64_t i = 0; i < K; ++i) {
 ### 4.3 Phase 2：生成 K 个淘汰候选
 
 ```cpp
-int32_t candidateCount = 0;
+int64_t candidateCount = 0;
 for (int64_t p = 2 * K; p > 0 && candidateCount < K; --p) {
-    int32_t id = lruLocal.GetValue(p - 1);
+    int16_t id = lruLocal.GetValue(p - 1);
     if (bitmapLocal.GetValue(id) == 0) {
         candidateLocal.SetValue(candidateCount++, id);
     }
@@ -203,10 +204,10 @@ for (int64_t p = 2 * K; p > 0 && candidateCount < K; --p) {
 ### 4.4 Phase 3：回填 hit，并扩展 selected bitmap
 
 ```cpp
-int32_t missRank = 0;
+int64_t missRank = 0;
 for (int64_t i = 0; i < K; ++i) {
     if (maskLocal.GetValue(i) == 0) {
-        int32_t id = candidateLocal.GetValue(missRank++);
+        int16_t id = candidateLocal.GetValue(missRank++);
         hitLocal.SetValue(i, id);  // hitLocal 原地成为 filled hit
         bitmapLocal.SetValue(id, static_cast<int16_t>(1));
     }
@@ -221,9 +222,9 @@ Phase 1 已标记原 hit；Phase 3 再标记实际用于回填的前 M 个 candi
 candidate 在 Phase 3 后已消费完，可将 `candidateLocal[K]` 原地复用为 `remainingLocal`：
 
 ```cpp
-int32_t keepCount = 0;
+int64_t keepCount = 0;
 for (int64_t p = 0; p < 2 * K; ++p) {
-    int32_t id = lruLocal.GetValue(p);
+    int16_t id = lruLocal.GetValue(p);
     if (bitmapLocal.GetValue(id) == 0) {
         candidateLocal.SetValue(keepCount++, id);
     }
@@ -245,9 +246,9 @@ for (int64_t i = 0; i < K; ++i) {
 
 WaitScalarToMte3();
 DataCopyPad(hitGm[b * K], hitLocal,
-            K * sizeof(int32_t));
+            K * sizeof(int16_t));
 DataCopyPad(newLruGm[b * 2 * K], lruLocal,
-            2 * K * sizeof(int32_t));
+            2 * K * sizeof(int16_t));
 WaitMte3ToScalar(); // 同一 core 进入下一行并复用 UB 前必须等待
 ```
 
@@ -266,10 +267,9 @@ struct BuildLruPlanTilingData {
     int64_t k;              // K
     int64_t lruLength;      // 2K
     int64_t bitmapElements; // A16(2K)，int16 元素数
-    int64_t hitElements;    // A8(K)
-    int64_t lruElements;    // A8(2K)
+    int64_t hitElements;    // A16(K)
+    int64_t lruElements;    // A16(2K)
     int64_t maskBytes;      // A32(K)
-    int64_t tilingKey;      // 0=row-fused, 1=tiled-fallback
 };
 ```
 
@@ -290,12 +290,11 @@ blockDim  = max(1, min(B, deviceAivCoreNum))
 定义：
 
 ```text
-A8(x)  = AlignUp(x, 8)    # int32 的 32B 对齐元素数
 A16(x) = AlignUp(x, 16)   # int16 的 32B 对齐元素数
 A32(x) = AlignUp(x, 32)   # uint8 的 32B 对齐字节数
 
-HK = A8(K)
-L  = A8(2K)
+HK = A16(K)
+L  = A16(2K)
 BM = A16(2K)
 MK = A32(K)
 ```
@@ -303,11 +302,11 @@ MK = A32(K)
 | Buffer | dtype | 数量 | 大小（Byte） | 生命周期 |
 |---|---|---:|---:|---|
 | `bitmapLocal` | int16 | 1 | `2*BM` | Phase 1–4 |
-| `hitLocal` | int32 | 1 | `4*HK` | 搬入至最终写回 |
+| `hitLocal` | int16 | 1 | `2*HK` | 搬入至最终写回 |
 | `maskLocal` | uint8 | 1 | `MK` | Phase 1、3 |
-| `lruLocal` | int32 | 1 | `4*L` | 搬入、Phase 2/4、最终输出 |
-| `candidateLocal` | int32 | 1 | `4*HK` | Phase 2/3，Phase 4 复用为 remaining |
-| **总计** | | | **`2*BM + MK + 8*HK + 4*L`** | |
+| `lruLocal` | int16 | 1 | `2*L` | 搬入、Phase 2/4、最终输出 |
+| `candidateLocal` | int16 | 1 | `2*HK` | Phase 2/3，Phase 4 复用为 remaining |
+| **总计** | | | **`2*BM + MK + 4*HK + 2*L`** | |
 
 这也是 row-fused 路径的 `bufferCoefficient` 精确形式。所有子区域起点按 32B 对齐，不使用
 double buffer；单行各 phase 有顺序依赖，`B<=C` 时每核通常也没有下一行可供稳定流水。
@@ -315,7 +314,7 @@ double buffer；单行各 phase 有顺序依赖，`B<=C` 时每核通常也没�
 Host 必须验证：
 
 ```text
-fusedUbBytes = 2*A16(2K) + A32(K) + 8*A8(K) + 4*A8(2K)
+fusedUbBytes = 2*A16(2K) + A32(K) + 4*A16(K) + 2*A16(2K)
 fusedUbBytes + UB_RESERVE_BYTES <= deviceUbBytes
 UB_RESERVE_BYTES = 8KB
 ```
@@ -324,22 +323,16 @@ UB_RESERVE_BYTES = 8KB
 
 ```text
 BM=4096, MK=2048, HK=2048, L=4096
-fusedUbBytes = 8192 + 2048 + 16384 + 16384 = 43,008 Byte
-fusedUbBytes + 8KB reserve = 51,200 Byte
+fusedUbBytes = 8192 + 2048 + 8192 + 8192 = 26,624 Byte
+fusedUbBytes + 8KB reserve = 34,816 Byte
 ```
 
-约占示例 192KB UB 的 26.0%，容量充足。渐近 UB 需求约为 `21K Byte`，仍小于把 bitmap
-保留为 float32 时的约 `25K Byte`。
+约占示例 192KB UB 的 17.7%，容量充足。渐近 UB 需求约为 `13K Byte`。
 
-### 5.4 超大 K fallback
+### 5.4 容量与 ID 上界
 
-为避免缩小已有接口的可接受范围，推荐把当前四 Kernel 小 Tile 实现保留为
-`tilingKey=1` fallback，仅在 row-fused UB 容量检查失败时使用。Host 必须分别计算两条
-路径的 workspace、blockDim 和 launch 参数。
-
-如果项目明确只覆盖 `K<=2048` 等固定范围，可以删除 fallback，并用 `TORCH_CHECK`
-输出 `K`、所需 UB、reserve 后可用 UB。禁止尝试用截断 Tile 长度启动 row-fused Kernel，
-因为它依赖完整行在同一 task 内可见。
+Host 同时检查 `K<=16384` 和 row-fused UB 需求。超过任一上限均明确报错，
+当前实现不再保留分块备用路径。
 
 ---
 
@@ -358,8 +351,7 @@ row-fused 快速路径的 bitmap、candidate、counts、keep 全部只存在于 
 - `keep_counts`
 
 对 `B=1,K=2048`，当前实现按现有 stride 公式约分配 49,984 Byte workspace；快速路径
-降为 0。无需额外 system workspace。若进入 tiled fallback，则仍按旧路径公式分配临时
-Tensor，并由 PyTorch current stream 生命周期管理。
+降为 0。无需额外 system workspace。
 
 ---
 
@@ -384,13 +376,13 @@ Tensor，并由 PyTorch current stream 生命周期管理。
 
 | 对象 | 读 | 写 |
 |---|---:|---:|
-| `hit` | `4K` | `4K` |
+| `hit` | `2K` | `2K` |
 | `hit_mask` | `K` | 0 |
-| `lru` | `8K` | 0 |
-| `new_lru` | 0 | `8K` |
-| **合计** | **`13K`** | **`12K`** |
+| `lru` | `4K` | 0 |
+| `new_lru` | 0 | `4K` |
+| **合计** | **`7K`** | **`6K`** |
 
-总计 **`25K Byte/row`**；`K=2048` 时为 51,200 Byte/row。没有任何中间 GM 读写。
+总计 **`13K Byte/row`**；`K=2048` 时为 26,624 Byte/row。没有任何中间 GM 读写。
 
 ### 7.3 权衡与验收假设
 
@@ -424,11 +416,11 @@ Tensor，并由 PyTorch current stream 生命周期管理。
 
 ### 9.1 Host
 
-- [ ] 新增 row-fused UB 字节计算与 `tilingKey` 选择；
+- [ ] 新增 int16 row-fused UB 字节计算；
 - [ ] 快速路径不分配任何 GM workspace，只创建 `new_lru`；
 - [ ] 快速路径 `blockDim=max(1,min(B,C))`；
 - [ ] 快速路径只 launch `build_lru_plan_row` 一次；
-- [ ] 若保留 fallback，旧四 Kernel 及 workspace 仅在容量不足时启用；
+- [ ] 检查 `K<=16384`，UB 容量不足时明确报错；
 - [ ] 保持 device/dtype/shape/contiguous/overlap/overflow 检查。
 
 ### 9.2 Kernel
@@ -475,7 +467,7 @@ CPU 模拟必须额外验证：
 | hit 分布 | 全 hit、全 miss、单 miss、约 50%、约 80%、miss 集中在首/尾 |
 | batch | `B=1,2,16,40,41,80` |
 | 接口 | dtype/shape/device/非连续 hit/存储重叠 |
-| 容量 | row-fused 临界 K、刚超过临界 K 的 fallback 或报错 |
+| 容量 | row-fused 临界 K、刚超过临界 K 的报错 |
 
 ### 10.2 NPU 性能验收
 

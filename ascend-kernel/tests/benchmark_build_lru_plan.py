@@ -36,11 +36,11 @@ def make_inputs(batch_size, k, hit_rate, seed):
     hit_rows = []
 
     for _ in range(batch_size):
-        lru_row = torch.randperm(2 * k, generator=generator).to(torch.int32)
+        lru_row = torch.randperm(2 * k, generator=generator).to(torch.int16)
         hit_indices = torch.randperm(2 * k, generator=generator)[:hit_count]
         valid_hits = lru_row[hit_indices]
         hit_row = torch.cat(
-            [valid_hits, torch.full((k - hit_count,), -1, dtype=torch.int32)]
+            [valid_hits, torch.full((k - hit_count,), -1, dtype=torch.int16)]
         )
         hit_row = hit_row[torch.randperm(k, generator=generator)]
         lru_rows.append(lru_row)
@@ -67,8 +67,8 @@ def build_lru_plan_reference(lru, hit, hit_mask):
         output_hit.append(filled)
         output_lru.append(filled + remaining)
     return (
-        torch.tensor(output_lru, dtype=torch.int32),
-        torch.tensor(output_hit, dtype=torch.int32),
+        torch.tensor(output_lru, dtype=torch.int16),
+        torch.tensor(output_hit, dtype=torch.int16),
     )
 
 
@@ -141,7 +141,7 @@ def benchmark(args):
     accesses_per_second = rows_per_second * args.k
     actual_hit_rate = hit_count / args.k
 
-    print("build_lru_plan correctness: PASS (exact int32 match)")
+    print("build_lru_plan correctness: PASS (exact int16 match)")
     print(
         f"shape: lru=({args.batch_size}, {2 * args.k}), "
         f"hit=({args.batch_size}, {args.k})"
@@ -178,6 +178,8 @@ def parse_args():
 
     if args.batch_size <= 0 or args.k <= 0:
         parser.error("--batch-size and --k must be positive")
+    if args.k > 16384:
+        parser.error("--k must be <= 16384 because IDs are stored as int16")
     if not 0.0 <= args.hit_rate <= 1.0:
         parser.error("--hit-rate must be in [0, 1]")
     if args.warmup < 0 or args.iterations <= 0 or args.latency_samples <= 0:

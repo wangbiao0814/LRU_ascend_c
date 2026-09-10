@@ -32,8 +32,8 @@ def build_lru_plan_reference(lru, hit, hit_mask=None):
         output_hit.append(filled)
         output_lru.append(filled + remaining)
     return (
-        torch.tensor(output_lru, dtype=torch.int32),
-        torch.tensor(output_hit, dtype=torch.int32),
+        torch.tensor(output_lru, dtype=torch.int16),
+        torch.tensor(output_hit, dtype=torch.int16),
     )
 
 
@@ -49,12 +49,12 @@ def make_inputs(batch_size, k, seed, all_miss=False, no_miss=False):
             valid_count = k
         else:
             valid_count = int(torch.randint(0, k + 1, (1,), generator=generator))
-        valid = lru_row[:valid_count].to(torch.int32)
+        valid = lru_row[:valid_count].to(torch.int16)
         hit_row = torch.cat(
-            [valid, torch.full((k - valid_count,), -1, dtype=torch.int32)]
+            [valid, torch.full((k - valid_count,), -1, dtype=torch.int16)]
         )
         order = torch.randperm(k, generator=generator)
-        lru_rows.append(lru_row.to(torch.int32))
+        lru_rows.append(lru_row.to(torch.int16))
         hit_rows.append(hit_row[order])
     return torch.stack(lru_rows), torch.stack(hit_rows)
 
@@ -154,8 +154,8 @@ def build_lru_plan_staged(lru, hit, tile_length):
         output_lru.append(new_lru_row)
 
     return (
-        torch.tensor(output_lru, dtype=torch.int32),
-        torch.tensor(output_hit, dtype=torch.int32),
+        torch.tensor(output_lru, dtype=torch.int16),
+        torch.tensor(output_hit, dtype=torch.int16),
     )
 
 
@@ -289,8 +289,8 @@ def build_lru_plan_parallel_staged(
         output_lru.append(filled + [value for tile in keep_values for value in tile])
 
     return (
-        torch.tensor(output_lru, dtype=torch.int32),
-        torch.tensor(output_hit, dtype=torch.int32),
+        torch.tensor(output_lru, dtype=torch.int16),
+        torch.tensor(output_hit, dtype=torch.int16),
     )
 
 
@@ -332,8 +332,8 @@ def build_lru_plan_row_fused(lru, hit, hit_mask):
         output_lru.append(hit_local + remaining)
 
     return (
-        torch.tensor(output_lru, dtype=torch.int32),
-        torch.tensor(output_hit, dtype=torch.int32),
+        torch.tensor(output_lru, dtype=torch.int16),
+        torch.tensor(output_hit, dtype=torch.int16),
     )
 
 
@@ -504,6 +504,8 @@ def test_random_valid_inputs(npu_device, batch_size, k, seed):
         lru.to(npu_device), hit_npu, hit_mask_npu
     )
 
+    assert actual_lru.dtype == torch.int16
+    assert hit_npu.dtype == torch.int16
     torch.testing.assert_close(actual_lru.cpu(), expected_lru, rtol=0, atol=0)
     torch.testing.assert_close(hit_npu.cpu(), expected_hit, rtol=0, atol=0)
     torch.testing.assert_close(actual_lru[:, :k].cpu(), hit_npu.cpu(), rtol=0, atol=0)
@@ -555,12 +557,21 @@ def test_rejects_noncontiguous_hit(npu_device):
 def test_rejects_wrong_dtype(npu_device):
     lru, hit = make_inputs(1, 3, 31)
     hit_mask = hit.ne(-1)
-    with pytest.raises(RuntimeError, match="lru and hit must be int32"):
+    with pytest.raises(RuntimeError, match="lru and hit must be int16"):
         torch.ops.npu.build_lru_plan(
             lru.to(device=npu_device, dtype=torch.int64),
             hit.to(npu_device),
             hit_mask.to(npu_device),
         )
+
+
+def test_rejects_int16_id_overflow(npu_device):
+    k = 16385
+    lru = torch.zeros((1, 2 * k), dtype=torch.int16, device=npu_device)
+    hit = torch.full((1, k), -1, dtype=torch.int16, device=npu_device)
+    hit_mask = torch.zeros((1, k), dtype=torch.bool, device=npu_device)
+    with pytest.raises(RuntimeError, match="int16 IDs require K <= 16384"):
+        torch.ops.npu.build_lru_plan(lru, hit, hit_mask)
 
 
 def test_rejects_wrong_mask(npu_device):
