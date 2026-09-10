@@ -19,6 +19,7 @@
 #include "torch_kernel_helper.h"
 #include "tiling/platform/platform_ascendc.h"
 
+#include "aclrtlaunch_build_lru_plan_row.h"
 #include "aclrtlaunch_build_lru_plan_hit_local.h"
 #include "aclrtlaunch_build_lru_plan_candidate_local.h"
 #include "aclrtlaunch_build_lru_plan_materialize.h"
@@ -101,6 +102,14 @@ int64_t MaximumKernelUbBytes(int64_t k, int64_t lruStride,
                  keepWriteBytes));
 }
 
+int64_t FusedKernelUbBytes(int64_t bitmapElements, int64_t maskBytes,
+                           int64_t hitElements, int64_t lruElements)
+{
+    return bitmapElements * static_cast<int64_t>(sizeof(int16_t)) + maskBytes +
+           2 * hitElements * static_cast<int64_t>(sizeof(int32_t)) +
+           lruElements * static_cast<int64_t>(sizeof(int32_t));
+}
+
 }  // namespace
 
 at::Tensor build_lru_plan(const at::Tensor &lru, at::Tensor &hit,
@@ -155,6 +164,25 @@ at::Tensor build_lru_plan(const at::Tensor &lru, at::Tensor &hit,
     TORCH_CHECK(ubSizeBytes > kUbReserveBytes,
                 "build_lru_plan: platform UB is smaller than the safety reserve");
 
+    // Fast path: one AIV task owns a complete row.  K/2K inputs stay resident
+    // in UB, so all four logical stages can be fused without GM workspace.
+    int64_t bitmapElements = AlignUp(lruLength, 16);
+    int64_t maskBytes = AlignUp(k, 32);
+    int64_t hitElements = AlignUp(k, kInt32PerDataBlock);
+    int64_t lruElements = AlignUp(lruLength, kInt32PerDataBlock);
+    int64_t fusedUbBytes = FusedKernelUbBytes(
+        bitmapElements, maskBytes, hitElements, lruElements);
+    if (fusedUbBytes + kUbReserveBytes <= ubSizeBytes) {
+        uint32_t rowBlockDim = MakeBlockDim(batchSize, coreNum);
+        EXEC_KERNEL_CMD(build_lru_plan_row, rowBlockDim,
+                        lruContiguous, hit, hitMaskContiguous, newLru,
+                        batchSize, k, lruLength, bitmapElements, maskBytes,
+                        hitElements, lruElements);
+        return newLru;
+    }
+
+    // Capacity fallback: preserve the existing tile-parallel implementation
+    // for K values whose complete row does not fit in UB.
     int64_t lruStride = AlignUp(lruLength, kInt32PerCacheLine);
     int64_t lruTileLength = MakeParallelTileLength(
         lruLength, batchSize, coreNum);
@@ -175,7 +203,7 @@ at::Tensor build_lru_plan(const at::Tensor &lru, at::Tensor &hit,
     TORCH_CHECK(maximumUbBytes + kUbReserveBytes <= ubSizeBytes,
                 "build_lru_plan: K=", k,
                 " requires ", maximumUbBytes,
-                " UB bytes for the fused path, but only ",
+                " UB bytes for the tile fallback path, but only ",
                 ubSizeBytes - kUbReserveBytes, " bytes are available");
 
     TORCH_CHECK(batchSize <= std::numeric_limits<int64_t>::max() / lruStride,

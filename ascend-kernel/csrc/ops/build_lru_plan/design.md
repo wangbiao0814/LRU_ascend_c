@@ -1,23 +1,51 @@
-# build_lru_plan：hit_mask 输入与 hit 原地回填设计
+# build_lru_plan：整行 K / 2K Row-Fused 设计
 
 ## 1. 目标与设计结论
 
-本次接口升级在现有 4-Kernel V2 流水上完成两项变更：
+当前实现只有 K1 使用“一个 AIV task 独占一个 batch 行”，K2、K3、K4 仍按小 Tile
+切分。以 `B=1,K=2048,C=40` 为例，当前 `TH=48`、`TL=96`、`NH=NL=43`；K2/K3
+的每个小 Tile 都会重复读取整行 bitmap、candidate values 或 metadata，K4 又把 K3 的
+临时结果读回后写到最终输出。高 task 并行度同时带来了成倍的 GM 流量、短 DMA 和 Scalar
+prefix/suffix 扫描。
 
-1. 新增与 `hit` 同 shape 的 `hit_mask` 输入。原始 `hit[b, i] == -1` 时
-   `hit_mask[b, i] == false`，否则为 `true`。
-2. 删除 `hit_and_miss` 输出；算子执行结束后，直接把淘汰 ID 写入 `hit` 的 miss
-   位置，`hit` 成为填充完成的 hit/miss 序列。
+用户提出的方向正确：数据对象为 hit/mask/candidate 时，单核粒度取 `K`；数据对象为
+LRU 时，单核粒度取 `2K`，整行读入、计算、最后连续写回。
 
-推荐实现仍为纯 **AscendC Vector Kernel**，不涉及 Cube、CATLASS 或 ACLNN 封装。
-PyTorch 和 NumPy 均没有 `build_lru_plan` 同名标准接口，因此采用本项目的自定义原地
-语义，并在 dispatcher schema 中显式声明 `hit` 可变。
+进一步地，当一整行由同一个 AIV core 处理时，原 K1→K2→K3→K4 的依赖全部变成核内
+顺序依赖，不再需要 Kernel launch 作为全局 barrier。因此推荐快速路径不是四个“大 Tile
+Kernel”，而是 **一个 row-fused Kernel**，把原四阶段变成四个核内逻辑 phase：
 
-本设计的核心访存优化不是简单地把 `hit_and_miss` 重命名为 `hit`，而是利用
-`hit_mask` 在 materialize 阶段现场计算 Tile 内 miss rank，从而删除 `hit_rank`
-workspace 及其一次 GM 写、一次 GM 读。`hit_mask` 必须由上游直接提供为连续
-`torch.bool`；若为本算子单独启动 `(hit != -1)` Kernel 生成，额外 launch 和 MTE
-可能抵消收益。
+```text
+每个 AIV task 独占一行 b
+
+GM: hit[K] + hit_mask[K] + lru[2K]
+                    |
+                    | 一次整行搬入
+                    v
+UB Phase 1: 由原 hit 构造 selected bitmap
+UB Phase 2: 逆序扫描 lru，生成前 K 个 candidate
+UB Phase 3: 以 candidate 回填 miss，并更新 selected bitmap
+UB Phase 4: 正序扫描 lru，生成 remaining K
+                    |
+                    | hit 一次写回；new_lru[2K] 一次写回
+                    v
+GM: hit(in-place)[K] + new_lru[2K]
+```
+
+row-fused 快速路径具有以下结果：
+
+- Kernel launch 从 4 次降为 1 次；
+- 删除所有阶段间 bitmap/candidate/count/keep workspace；
+- bitmap 不再需要 atomic，可从 `float32[2K]` 改为 UB 内 `int16[2K]`；
+- 每个输入对象整行只读取一次；
+- 每个输出对象最终只连续写回一次；
+- Block 级并行度为 `min(B,C)`，`B=1` 时只使用一个 AIV，这是减少冗余访存的明确权衡。
+
+对整行数据无法装入 UB 的超大 K，Host 应选择保留的旧 tiled 路径；若项目只支持固定
+小 K，则可以不保留 fallback，但必须明确报错，不能越界分配 UB。
+
+实现路径为纯 **AscendC Vector Kernel**。本算子没有 PyTorch/NumPy 同名标准接口，继续
+采用项目自定义的 `hit` 原地更新语义。
 
 ---
 
@@ -40,565 +68,429 @@ m.def(
     "-> Tensor new_lru");
 ```
 
-`Tensor(a!) hit` 表示算子会修改 `hit` 的底层存储。返回值只有 `new_lru`，调用方式为：
-
 ```python
 new_lru = torch.ops.npu.build_lru_plan(lru, hit, hit_mask)
-# 此时 hit 中原来的 -1 已被淘汰 ID 替换
+# hit 已原地回填，且 new_lru[:, :K] == hit
 ```
 
-### 2.3 参数与约束
+### 2.3 参数、数据类型与约束
 
 | 名称 | 方向 | Shape | dtype | 说明 |
 |---|---|---:|---|---|
 | `lru` | 输入 | `[B, 2K]` | `int32` | 每行按 MRU 到 LRU 排列 |
-| `hit` | 输入/原地输出 | `[B, K]` | `int32` | 输入时 `-1` 表示 miss；输出时 miss 已用淘汰 ID 填充 |
-| `hit_mask` | 输入 | `[B, K]` | `bool` | 原始 `hit != -1` 的 0/1 掩码；算子不修改 |
-| `new_lru` | 输出 | `[B, 2K]` | `int32` | 更新后的 LRU，且 `new_lru[:, :K] == hit` |
+| `hit` | 输入/原地输出 | `[B, K]` | `int32` | 输入 `-1` 表示 miss，输出时已回填 |
+| `hit_mask` | 输入 | `[B, K]` | `bool` | 调用前 `hit != -1` 的掩码 |
+| `new_lru` | 输出 | `[B, 2K]` | `int32` | 更新后的 LRU |
 
-Host 端必须检查：
+Host 必须检查：
 
-- 三个 Tensor 均位于同一 NPU device；
-- `lru`、`hit` 为 `int32`，`hit_mask` 为 `torch.bool`；
-- 三者均为二维，`hit_mask.sizes() == hit.sizes()`；
-- `B > 0`、`K > 0`、`lru.size(0) == B`、`lru.size(1) == 2K`；
-- `hit` 必须连续。原地语义下不能用 `hit.contiguous()` 的临时副本代替原 Tensor，
-  否则调用者看不到回填结果；
-- `lru`、`hit_mask` 是只读输入，可保留 `.contiguous()` 兼容路径，但性能路径要求上游
-  直接提供连续 Tensor，避免隐藏的格式转换和额外 MTE；
-- `hit` 的存储不能与 `lru` 或 `hit_mask` 重叠。materialize Kernel 中存在并行的
-  `lru` 读取和 `hit` 写回，重叠会产生核间数据竞争。
+- 三个 Tensor 位于同一 NPU device；
+- `lru`、`hit` 为 `int32`，`hit_mask` 为 `bool`；
+- 三者均为 rank 2，`B>0`、`K>0`，shape 分别为 `[B,2K]`、`[B,K]`、`[B,K]`；
+- `hit` 必须连续，且不与 `lru`、`hit_mask` 存储重叠；
+- `lru`、`hit_mask` 可由 Host 转连续，但性能路径要求调用方直接提供连续 Tensor；
+- `K <= INT32_MAX/2`，所有 shape、offset、UB 字节数计算均检查 int64 溢出；
+- row-fused 路径满足第 5 节 UB 容量约束，否则进入 tiled fallback 或明确报错。
 
-性能路径不把数据复制到 CPU 做值域或一致性检查。调用方必须保证：
+性能路径不做 NPU→CPU 值域同步。调用方保证：
 
 ```text
-hit_mask[b, i] == false  <=>  hit[b, i] == -1       # 调用前
-hit_mask[b, i] == true   <=>  hit[b, i] != -1
+hit_mask[b,i] == false  <=>  hit[b,i] == -1
+lru[b] 是 0..2K-1 的排列
+有效 hit ID 位于 0..2K-1，且行内互不重复
 ```
 
-每行 `lru` 必须是 `0..2K-1` 的排列，所有有效 hit ID 位于该范围且互不重复。
-不满足这些条件时行为未定义。`hit_mask` 描述的是调用前的 `hit`，算子结束后不会随
-原地回填而改变。
+本算子仅涉及 int32/bool 搬运、比较和索引，不涉及 FP16/BF16，也不需要升精度 Cast。
 
 ---
 
-## 3. 计算语义
+## 3. 计算语义与容量证明
 
-对每个 batch 行独立执行：
+对每个 batch 行：
 
 ```python
-hit_ids = {hit[i] for i in range(K) if hit_mask[i]}
-candidates = [id for id in reversed(lru) if id not in hit_ids]
+original_hit_ids = {hit[i] for i in range(K) if hit_mask[i]}
+candidates = [x for x in reversed(lru) if x not in original_hit_ids]
 
-candidate_it = iter(candidates)
+miss_rank = 0
 for i in range(K):
     if not hit_mask[i]:
-        hit[i] = next(candidate_it)       # 原地回填
+        hit[i] = candidates[miss_rank]
+        miss_rank += 1
 
 selected = set(hit)
-new_lru = hit + [id for id in lru if id not in selected]
+new_lru = hit + [x for x in lru if x not in selected]
 ```
 
-输出不再包含 `hit_and_miss`；其旧语义完全由原地更新后的 `hit` 承担。
-
-### 3.1 四 Kernel 数据流
+设原 hit 数为 `H`、miss 数为 `M=K-H`。LRU 行含 `2K` 个唯一 ID，H 个原 hit 都在
+LRU 中，因此非原-hit ID 数为：
 
 ```text
-K1 hit_local
-  hit -> hit_bitmap + hit_counts
-                |
-                v
-K2 candidate_local
-  lru + hit_bitmap -> candidate_values + candidate_counts
-                |
-                v
-K3 materialize
-  hit + hit_mask + counts/candidates -> hit(in-place) + new_lru[:K]
-  lru + hit_bitmap + counts          -> keep_values + keep_counts
-                |
-                v
-K4 keep_scan_write
-  keep_values + keep_counts -> new_lru[K:]
+2K - H = K + M >= K
 ```
 
-普通 AscendC Kernel 内没有跨 AIV 全局 barrier，因此 K1→K2、K2→K3、K3→K4 的
-全局生产者/消费者边界仍通过同一 stream 上的顺序 Kernel launch 保证，不能继续直接
-融合。
+所以 Phase 2 只需保存淘汰顺序的前 `K` 个 candidate，必然覆盖最坏的全 miss 情况；
+Phase 3 实际只消费前 `M` 个。最终 selected 集合恰有 K 个 ID，因此 Phase 4 也恰好
+产生 K 个 remaining ID。
 
 ---
 
-## 4. AscendC Kernel 设计与 API 伪代码
+## 4. Row-Fused Kernel 与 AscendC API 伪代码
 
-### 4.1 K1 `build_lru_plan_hit_local`
-
-任务空间为 `B`，每个任务独占一整行。K1 一次搬入整行 `hit`，在 UB 内构造完整
-`hit_bitmap` 和全部 `hit_counts`，然后各进行一次连续搬出。不同任务写不同 batch 行，
-因此不需要 float atomic add。Host 使用 `empty` 分配 bitmap，K1 完整覆盖包含 padding
-在内的 `lruStride`。
-
-K1 直接使用 `id == -1` 统计每个原始 Hit Tile 的 miss，不额外搬入 `hit_mask`，也不再
-生成 `hit_rank`。
+推荐 Kernel 名称：
 
 ```cpp
-Duplicate(bitmapLocal, 0.0f, lruStride);
-Duplicate(countLocal, 0, hitMetaStride);
-DataCopyPad(hitLocal, hitGm[rowOffset], wholeRowParams, noPad);
-SetFlag<HardEvent::MTE2_S>(mte2ToS);
-WaitFlag<HardEvent::MTE2_S>(mte2ToS);
-SetFlag<HardEvent::V_S>(vToS);
-WaitFlag<HardEvent::V_S>(vToS);
-
-for (int64_t ht = 0; ht < hitTileCount; ++ht) {
-    int32_t missCount = 0;
-    for (int64_t p = tileBegin(ht); p < tileEnd(ht); ++p) {
-        int32_t id = hitLocal.GetValue(p);
-        if (id == -1) {
-            ++missCount;
-        } else {
-            bitmapLocal.SetValue(id, 1.0f);
-        }
-    }
-    countLocal.SetValue(ht, missCount);
-}
-
-SetFlag<HardEvent::S_MTE3>(sToMte3);
-WaitFlag<HardEvent::S_MTE3>(sToMte3);
-DataCopyPad(hitBitmapGm[bitmapOffset], bitmapLocal, bitmapRowParams);
-DataCopyPad(hitCountsGm[countOffset], countLocal, countRowParams);
+extern "C" __global__ __aicore__ void build_lru_plan_row(...);
 ```
 
-这个行独占方案避免了两种低效路径：每 Hit Tile 全量 atomic bitmap，以及每有效 ID
-一次 4B 随机短 DMA。代价是 K1 的最大并行度为 `min(B, C)`；对 `B=16` 已有 16 个
-并行任务，连续 DMA 和较低的指令数优先于进一步切分。
-
-### 4.2 K2 `build_lru_plan_candidate_local`
-
-任务空间为 `B * NL`，与现有 V2 相同。每个 LRU Tile 从右向左筛选未命中 ID，按
-淘汰顺序紧凑写入自己的固定 slot。
+任务空间为 B，每个 task 独占一行：
 
 ```cpp
-DataCopyPad(bitmapLocal, hitBitmapGm[row], bitmapParams, noPad);
-DataCopyPad(lruLocal, lruGm[tileOffset], lruParams, noPad);
-SetFlag<HardEvent::MTE2_S>(mte2ToS);
-WaitFlag<HardEvent::MTE2_S>(mte2ToS);
+for (int64_t b = GetBlockIdx(); b < batchSize; b += GetBlockNum()) {
+    ProcessRow(b);
+}
+```
 
-int32_t count = 0;
-for (int64_t p = validLen; p > 0; --p) {
+### 4.1 整行搬入与 bitmap 初始化
+
+```cpp
+Duplicate(bitmapLocal, static_cast<int16_t>(0), bitmapElements);
+
+DataCopyPad(hitLocal, hitGm[b * K],
+            K * sizeof(int32_t), noPad);
+DataCopyPad(maskLocal, hitMaskGm[b * K],
+            K * sizeof(uint8_t), noPad);
+DataCopyPad(lruLocal, lruGm[b * 2 * K],
+            2 * K * sizeof(int32_t), noPad);
+
+WaitMte2ToScalar();
+WaitVectorToScalar();
+```
+
+`bitmapLocal` 只在本 task 内由 Scalar 读写，不需要 atomic，也不写入 GM。旧实现为了跨
+task atomic bitmap 使用 float32；row-fused 路径改为 int16，取值仅为 0/1。没有使用
+uint8，是因为 Ascend A2/A3 的基础 `Duplicate` 不支持 uint8 operand。
+
+### 4.2 Phase 1：标记原 hit
+
+```cpp
+for (int64_t i = 0; i < K; ++i) {
+    if (maskLocal.GetValue(i) != 0) {
+        int32_t id = hitLocal.GetValue(i);
+        bitmapLocal.SetValue(id, static_cast<int16_t>(1));
+    }
+}
+```
+
+这里以 `hit_mask` 为语义来源；输入契约保证有效位置的 ID 不是 -1。
+
+### 4.3 Phase 2：生成 K 个淘汰候选
+
+```cpp
+int32_t candidateCount = 0;
+for (int64_t p = 2 * K; p > 0 && candidateCount < K; --p) {
     int32_t id = lruLocal.GetValue(p - 1);
-    if (bitmapLocal.GetValue(id) == 0.0f) {
-        candidateLocal.SetValue(count++, id);
+    if (bitmapLocal.GetValue(id) == 0) {
+        candidateLocal.SetValue(candidateCount++, id);
     }
 }
-
-SetFlag<HardEvent::S_MTE3>(sToMte3);
-WaitFlag<HardEvent::S_MTE3>(sToMte3);
-DataCopyPad(candidateValuesGm[slot], candidateLocal, valueParams);
-DataCopyPad(candidateCountsGm[countOffset], countLocal, oneInt32Params);
+// 合法输入下 candidateCount == K。
 ```
 
-### 4.3 K3 `build_lru_plan_materialize`
+`candidateLocal` 必须与 `lruLocal` 分离。若逆向读 lru、从低地址紧凑写同一 buffer，写
+指针可能在扫描结束前覆盖尚未读取的低地址 LRU 数据。
 
-任务空间为 `B * (NH + NL)`，包含两类互不重叠的任务。
-
-#### Hit Tile 任务
-
-使用 `bool hit_mask` 现场生成 Tile 内 exclusive miss rank，不再读取 `hit_rank`：
+### 4.4 Phase 3：回填 hit，并扩展 selected bitmap
 
 ```cpp
-DataCopyPad(hitLocal, hitGm[hitOffset], hitParams, noPad);
-DataCopyPad(maskLocal, hitMaskGm[maskOffset], maskParams, noPad);
-DataCopyPad(hitCountLocal, hitCountsGm[row], hitMetaParams, noPad);
-DataCopyPad(candidateCountLocal, candidateCountsGm[row], lruMetaParams, noPad);
-DataCopyPad(candidateValueLocal, candidateValuesGm[row], valueParams, noPad);
-SetFlag<HardEvent::MTE2_S>(mte2ToS);
-WaitFlag<HardEvent::MTE2_S>(mte2ToS);
-
-int32_t missBase = Sum(hitCountLocal[0 : hitTileIndex]);
-int32_t localMissRank = 0;
-for (int64_t p = 0; p < validLen; ++p) {
-    int32_t outputId = hitLocal.GetValue(p);
-    if (maskLocal.GetValue(p) == 0) {
-        int32_t rank = missBase + localMissRank;
-        outputId = LookupCandidateInReverseTileOrder(
-            rank, candidateCountLocal, candidateValueLocal);
-        ++localMissRank;
+int32_t missRank = 0;
+for (int64_t i = 0; i < K; ++i) {
+    if (maskLocal.GetValue(i) == 0) {
+        int32_t id = candidateLocal.GetValue(missRank++);
+        hitLocal.SetValue(i, id);  // hitLocal 原地成为 filled hit
+        bitmapLocal.SetValue(id, static_cast<int16_t>(1));
     }
-    outputLocal.SetValue(p, outputId);
+}
+```
+
+Phase 1 已标记原 hit；Phase 3 再标记实际用于回填的前 M 个 candidate。此时 bitmap
+准确表示最终 selected 集合，不需要第二张 bitmap。
+
+### 4.5 Phase 4：复用 candidate buffer 生成 remaining
+
+candidate 在 Phase 3 后已消费完，可将 `candidateLocal[K]` 原地复用为 `remainingLocal`：
+
+```cpp
+int32_t keepCount = 0;
+for (int64_t p = 0; p < 2 * K; ++p) {
+    int32_t id = lruLocal.GetValue(p);
+    if (bitmapLocal.GetValue(id) == 0) {
+        candidateLocal.SetValue(keepCount++, id);
+    }
+}
+// 合法输入下 keepCount == K。
+```
+
+这个阶段不再需要 `keep_counts`、prefix scan 或 K4。
+
+### 4.6 组装与最终连续写回
+
+为了使 `new_lru` 只进行一次连续 MTE3，完成 Phase 4 后复用 `lruLocal[2K]` 作为最终输出：
+
+```cpp
+for (int64_t i = 0; i < K; ++i) {
+    lruLocal.SetValue(i, hitLocal.GetValue(i));
+    lruLocal.SetValue(K + i, candidateLocal.GetValue(i));
 }
 
-SetFlag<HardEvent::S_MTE3>(sToMte3);
-WaitFlag<HardEvent::S_MTE3>(sToMte3);
-DataCopyPad(hitGm[hitOffset], outputLocal, outputParams);       // 原地回填
-DataCopyPad(newLruGm[lruHeadOffset], outputLocal, outputParams);
+WaitScalarToMte3();
+DataCopyPad(hitGm[b * K], hitLocal,
+            K * sizeof(int32_t));
+DataCopyPad(newLruGm[b * 2 * K], lruLocal,
+            2 * K * sizeof(int32_t));
+WaitMte3ToScalar(); // 同一 core 进入下一行并复用 UB 前必须等待
 ```
 
-同一个 Hit Tile 只由一个任务写，Tile 间逻辑区间互不重叠。`DataCopyPad` 只向 GM 写
-`blockLen` 指定的有效字节，尾 Tile 不会覆盖相邻任务。
-
-#### LRU Tile 任务
-
-与现有 V2 相同。设 `q[p]` 表示该 ID 不在 hit bitmap，`cnt[lt]` 为本 Tile 的候选数：
-
-```text
-reverseRank(p) = suffixOffset[lt] + cnt[lt] - prefixInclusive(p)
-keep(p)        = q[p] && reverseRank(p) >= rowMissCount
-```
-
-它只读取已完成的 `hit_bitmap`、`hit_counts`、`candidate_counts`，不会读取正在原地写回
-的 `hit`，因此可以与 Hit Tile 任务在同一 Kernel 中并行。
-
-### 4.4 K4 `build_lru_plan_keep_scan_write`
-
-任务空间为 `B * NL`，与现有 V2 相同。每个 Tile 读取紧凑 `keep_counts`，累加左侧
-count 得到 offset，再把自己的 `keep_values` 写到 `new_lru[K + offset]`。
-
-```cpp
-DataCopyPad(countLocal, keepCountsGm[row], metaParams, noPad);
-SetFlag<HardEvent::MTE2_S>(mte2ToS);
-WaitFlag<HardEvent::MTE2_S>(mte2ToS);
-int32_t offset = Sum(countLocal[0 : lruTileIndex]);
-int32_t count = countLocal.GetValue(lruTileIndex);
-DataCopyPad(valuesLocal, keepValuesGm[slot], valueParams, noPad);
-SetFlag<HardEvent::MTE2_S>(mte2ToS);
-WaitFlag<HardEvent::MTE2_S>(mte2ToS);
-SetFlag<HardEvent::S_MTE3>(sToMte3);
-WaitFlag<HardEvent::S_MTE3>(sToMte3);
-DataCopyPad(newLruGm[k + offset], valuesLocal, valueParams);
-```
-
-本算子只支持整数和布尔搬运/比较，不涉及 FP16/BF16，也不需要升精度 Cast 流程。
+Phase 4 扫描完整个原始 lru 后才覆盖 `lruLocal`，因此组装不会破坏未消费输入。最终每行
+只有一次 hit 原地写回和一次完整 new_lru 写回。
 
 ---
 
-## 5. 两级 Tiling 策略
+## 5. 两级 Tiling 与 UB 分配
 
-### 5.1 Tiling 参数结构体
+### 5.1 Tiling 参数
 
 ```cpp
 struct BuildLruPlanTilingData {
-    int64_t batchSize;
-    int64_t k;
-    int64_t lruLength;        // 2K
-    int64_t coreNum;          // 设备 AIV 数
-
-    int64_t hitTileLength;    // TH
-    int64_t lruTileLength;    // TL
-    int64_t hitTileCount;     // NH
-    int64_t lruTileCount;     // NL
-
-    int64_t lruStride;        // bitmap 行 stride，int32/float 元素数
-    int64_t hitMetaStride;    // hit_counts 行 stride，int32 元素数
-    int64_t lruMetaStride;    // candidate/keep counts 行 stride
-    int64_t valueStride;      // candidate/keep values 行 stride
-
-    int64_t scanMode;         // 0=on-the-fly, 1=row scan, 2=hierarchical
-    int64_t pipelineDepth;    // 初版固定 1；实测后可选 2
+    int64_t batchSize;      // B
+    int64_t k;              // K
+    int64_t lruLength;      // 2K
+    int64_t bitmapElements; // A16(2K)，int16 元素数
+    int64_t hitElements;    // A8(K)
+    int64_t lruElements;    // A8(2K)
+    int64_t maskBytes;      // A32(K)
+    int64_t tilingKey;      // 0=row-fused, 1=tiled-fallback
 };
 ```
 
-旧字段 `hitStride` 删除，因为不再存在 `hit_rank`。
+当前工程可继续通过 launch 参数传递这些值；该结构定义字段语义，供后续 code-gen 对齐。
 
-### 5.2 Block 级：二维任务切分
-
-```text
-L  = 2K
-C  = 设备 AIV 数
-R  = ceil(C / B)
-
-TH_parallel = clamp(AlignDown(K / R, 8), 8, 256)
-TL_parallel = clamp(AlignDown(L / R, 8), 8, 256)
-
-NH = ceil(K / TH)
-NL = ceil(L / TL)
-```
-
-`8 * sizeof(int32_t) == 32B`，常规 Tile 从 32B 边界开始。每个 Kernel 交错取任务：
-
-```cpp
-for (int64_t task = GetBlockIdx(); task < taskCount;
-     task += GetBlockNum()) {
-    ProcessTask(task);
-}
-```
-
-Host 设置 `blockDim = max(1, min(taskCount, coreNum))`。对重点场景
-`B=1, K=2048, C=40`：
+### 5.2 Block 级：按 batch 行切分
 
 ```text
-TH = 48, NH = 43
-TL = 96, NL = 43
+taskCount = B
+blockDim  = max(1, min(B, deviceAivCoreNum))
 ```
 
-K2/K3/K4 至少有 40 个有效任务。K1 使用行独占任务，`blockDim=min(B,C)`；重点场景
-`B=1` 使用一个 K1 Core，`B=16` 使用 16 个 K1 Core。
+`B=1` 使用 1 个 AIV，`B=16` 使用 16 个 AIV，`B>C` 时每核交错处理多行。同一行只有
+一个 writer，不需要 atomic，也不存在跨 task prefix/suffix 合并。
 
-### 5.3 UB 级：容量约束与 Buffer 分配
+### 5.3 UB 级：K / 2K 整行 Tile
 
-所有 UB buffer 按 32B 对齐。令：
+定义：
 
 ```text
-A8(x) = AlignUp(x, 8)          # int32/float 元素对齐
-A32(x) = AlignUp(x, 32)        # byte 对齐
-TH = hitTileLength
-TL = lruTileLength
+A8(x)  = AlignUp(x, 8)    # int32 的 32B 对齐元素数
+A16(x) = AlignUp(x, 16)   # int16 的 32B 对齐元素数
+A32(x) = AlignUp(x, 32)   # uint8 的 32B 对齐字节数
+
+HK = A8(K)
+L  = A8(2K)
+BM = A16(2K)
+MK = A32(K)
 ```
 
-#### K1 UB 分配
-
-| Buffer | dtype | 数量 | 大小（Byte） | 用途 |
+| Buffer | dtype | 数量 | 大小（Byte） | 生命周期 |
 |---|---|---:|---:|---|
-| `bitmapLocal` | float32 | 1 | `4 * lruStride` | 完整行 bitmap |
-| `hitLocal` | int32 | 1 | `4 * A8(K)` | 完整 hit 行 |
-| `countLocal` | int32 | 1 | `4 * hitMetaStride` | 全部 Hit Tile count |
-| **总计** | | | **`4*(lruStride+A8(K)+hitMetaStride)`** | |
+| `bitmapLocal` | int16 | 1 | `2*BM` | Phase 1–4 |
+| `hitLocal` | int32 | 1 | `4*HK` | 搬入至最终写回 |
+| `maskLocal` | uint8 | 1 | `MK` | Phase 1、3 |
+| `lruLocal` | int32 | 1 | `4*L` | 搬入、Phase 2/4、最终输出 |
+| `candidateLocal` | int32 | 1 | `4*HK` | Phase 2/3，Phase 4 复用为 remaining |
+| **总计** | | | **`2*BM + MK + 8*HK + 4*L`** | |
 
-三个区域的起点均按 32B 对齐。K1 UB 随行宽增长，由 Host 与其他 Kernel 一起进行容量
-上界检查。
+这也是 row-fused 路径的 `bufferCoefficient` 精确形式。所有子区域起点按 32B 对齐，不使用
+double buffer；单行各 phase 有顺序依赖，`B<=C` 时每核通常也没有下一行可供稳定流水。
 
-#### K2 UB 分配
-
-| Buffer | dtype | 数量 | 大小（Byte） |
-|---|---|---:|---:|
-| `bitmapLocal` | float32 | 1 | `4 * lruStride` |
-| `lruLocal` | int32 | 1 | `4 * TL` |
-| `candidateLocal` | int32 | 1 | `4 * TL` |
-| `countLocal` | int32 | 1 | `32` |
-| **总计** | | | **`4*lruStride + 8*TL + 32`** |
-
-Tile buffer coefficient 为 **8 Byte/TL 元素**。
-
-#### K3 UB 分配（分支复用）
-
-Hit Tile 与 LRU Tile 分支不会在同一任务内同时执行，行级 resident 区允许复用：
-
-| 区域 | Hit Tile 分支 | LRU Tile 分支 |
-|---|---:|---:|
-| 行级 resident | `4 * valueStride`（candidate values） | `4 * lruStride`（bitmap） |
-| 紧凑 metadata | `4*(hitMetaStride+lruMetaStride)` | 同左 |
-| 输入 Tile | `4*TH + A32(TH)` | `4*TL` |
-| 输出 Tile | `4*TH` | `4*TL` |
-| scalar block | `32` | `32` |
-
-因此：
+Host 必须验证：
 
 ```text
-K3_hit_bytes = 4*valueStride
-             + 4*(hitMetaStride+lruMetaStride)
-             + 8*TH + A32(TH) + 32
-
-K3_lru_bytes = 4*lruStride
-             + 4*(hitMetaStride+lruMetaStride)
-             + 8*TL + 32
-
-K3_ub_bytes  = max(K3_hit_bytes, K3_lru_bytes)
+fusedUbBytes = 2*A16(2K) + A32(K) + 8*A8(K) + 4*A8(2K)
+fusedUbBytes + UB_RESERVE_BYTES <= deviceUbBytes
+UB_RESERVE_BYTES = 8KB
 ```
 
-`hit_mask` 的 Tile buffer coefficient 为 **1 Byte/TH 元素**，但实际 buffer 大小向上
-对齐到 32B。两个 int32 输入/输出 Tile 的 coefficient 合计为 **8 Byte/TH 元素**。
-
-#### K4 UB 分配
+对 `K=2048`：
 
 ```text
-K4_ub_bytes = 4*lruMetaStride + 4*TL
+BM=4096, MK=2048, HK=2048, L=4096
+fusedUbBytes = 8192 + 2048 + 16384 + 16384 = 43,008 Byte
+fusedUbBytes + 8KB reserve = 51,200 Byte
 ```
 
-Host 端取四个阶段最大值，并验证：
+约占示例 192KB UB 的 26.0%，容量充足。渐近 UB 需求约为 `21K Byte`，仍小于把 bitmap
+保留为 float32 时的约 `25K Byte`。
 
-```text
-max(K1_ub_bytes, K2_ub_bytes, K3_ub_bytes, K4_ub_bytes)
-    <= deviceUbBytes - 8KB
-```
+### 5.4 超大 K fallback
 
-对 `B=1,K=2048,C=40`，有 `TH=48`、`TL=96`、`lruStride=4096`、
-`hitMetaStride=lruMetaStride=48`、`valueStride=4128`：
+为避免缩小已有接口的可接受范围，推荐把当前四 Kernel 小 Tile 实现保留为
+`tilingKey=1` fallback，仅在 row-fused UB 容量检查失败时使用。Host 必须分别计算两条
+路径的 workspace、blockDim 和 launch 参数。
 
-| Kernel | UB 使用量 |
-|---|---:|
-| K1 | `24,768 Byte` |
-| K2 | `17,184 Byte` |
-| K3 | `17,568 Byte` |
-| K4 | `576 Byte` |
-
-最大值约占示例 192KB UB 的 `12.60%`；再加 8KB reserve 仍满足约束。实际实现必须读取
-运行设备 UB 容量，不能把 192KB 写死。
-
-初版 `pipelineDepth=1`。只有 profiler 显示 MTE stall，且每核稳定获得至少 3 个 Tile
-任务时，才把 Tile 输入/输出区扩成双缓冲；行级 bitmap、metadata 和 candidate values
-不做双份分配。
+如果项目明确只覆盖 `K<=2048` 等固定范围，可以删除 fallback，并用 `TORCH_CHECK`
+输出 `K`、所需 UB、reserve 后可用 UB。禁止尝试用截断 Tile 长度启动 row-fused Kernel，
+因为它依赖完整行在同一 task 内可见。
 
 ---
 
-## 6. GM Workspace 与生命周期
+## 6. Workspace
 
-```text
-lruStride     = AlignUp(2K, 128)
-hitMetaStride = AlignUp(NH, 8)
-lruMetaStride = AlignUp(NL, 8)
-valueStride   = NL * TL
-```
+row-fused 快速路径的 bitmap、candidate、counts、keep 全部只存在于 UB，**GM workspace
+大小为 0 Byte**。只分配最终 `new_lru` 输出。
 
-| Workspace | dtype / Shape | 生产者 -> 消费者 |
-|---|---|---|
-| `hit_bitmap` | float32 `[B, lruStride]` | K1 -> K2/K3 |
-| `hit_counts` | int32 `[B, hitMetaStride]` | K1 -> K3 |
-| `candidate_counts` | int32 `[B, lruMetaStride]` | K2 -> K3 |
-| `candidate_values` | int32 `[B, valueStride]` | K2 -> K3 |
-| `keep_counts` | int32 `[B, lruMetaStride]` | K3 -> K4 |
-| `keep_values` | int32 `[B, valueStride]` | K3 -> K4 |
+以下当前 workspace 在快速路径全部删除：
 
-总 workspace：
+- `hit_bitmap`
+- `hit_counts`
+- `candidate_values`
+- `candidate_counts`
+- `keep_values`
+- `keep_counts`
 
-```text
-B * 4 * (lruStride + hitMetaStride + 2*lruMetaStride + 2*valueStride) Byte
-```
-
-旧 `hit_rank` workspace（`int32 [B, AlignUp(K,128)]`）和 `hit_and_miss` 输出均删除。
-`candidate_values` 在 K3 被读取时 `keep_values` 同时被写入，两者不能别名。
-
-不需要额外 system workspace；上述临时 Tensor 由 Host 在 current stream 上分配并由
-PyTorch 生命周期管理。
+对 `B=1,K=2048`，当前实现按现有 stride 公式约分配 49,984 Byte workspace；快速路径
+降为 0。无需额外 system workspace。若进入 tiled fallback，则仍按旧路径公式分配临时
+Tensor，并由 PyTorch current stream 生命周期管理。
 
 ---
 
-## 7. MTE 流量收益分析
+## 7. 性能分析
 
-K1 的 bitmap 构造流量与指令数单独计算：
+### 7.1 当前路径的重复开销
 
-| K1 路径 | bitmap 逻辑写量 | bitmap MTE3 指令数 |
+对 `B=1,K=2048,TH=48,TL=96,NH=NL=43`：
+
+- K2 的 43 个 task 各读一次完整 float bitmap；
+- K3 的 43 个 Hit task 各读一次接近 2K 的 candidate row；
+- K3 的 43 个 LRU task 各读一次完整 bitmap；
+- 每个 task 还读取 metadata，并做前缀/后缀 Scalar scan；
+- K3 写 keep workspace，K4 再读并写最终输出；
+- 总计 4 次 launch。
+
+这类重复开销随 `NH/NL` 增长，而有效算法工作量本来只需要每行 O(K)。
+
+### 7.2 row-fused 快速路径流量
+
+忽略对齐 padding，每行逻辑 GM 流量为：
+
+| 对象 | 读 | 写 |
 |---|---:|---:|
-| 每 Hit Tile 全量 atomic | `4*B*NH*lruStride` | `B*NH` |
-| 每有效 ID 稀疏短写 | `4*validHitCount` | `validHitCount` |
-| 当前行独占路径 | `4*B*lruStride` | `B` |
+| `hit` | `4K` | `4K` |
+| `hit_mask` | `K` | 0 |
+| `lru` | `8K` | 0 |
+| `new_lru` | 0 | `8K` |
+| **合计** | **`13K`** | **`12K`** |
 
-当前路径选择连续写量与低指令数之间的平衡，尤其避免大 batch、高 hit rate 下数万次
-4B 随机 `DataCopyPad`。另外 K1 完整覆盖 bitmap，因此 Host 使用 `empty` 而不是预先
-`zeros`，不额外产生一次全局清零。
+总计 **`25K Byte/row`**；`K=2048` 时为 51,200 Byte/row。没有任何中间 GM 读写。
 
-只统计受本次接口变更影响、按逻辑有效字节计算的 GM 流量：
+### 7.3 权衡与验收假设
 
-| 路径 | 旧 V2 | 新设计 |
-|---|---:|---:|
-| K1 读取 `hit` | `4BK` | `4BK` |
-| K1 写 `hit_rank` | `4BK` | `0` |
-| K3 读取 `hit` | `4BK` | `4BK` |
-| K3 读取 rank/mask | `4BK` rank | `BK` bool mask |
-| K3 写填充结果 | `4BK` 到 `hit_and_miss` | `4BK` 原地写 `hit` |
-| K3 写 `new_lru[:K]` | `4BK` | `4BK` |
-| **合计** | **`24BK` Byte** | **`17BK` Byte** |
+- 主要收益：4→1 launch、输入只读一次、中间 GM workspace 清零、bitmap int16 化、删除
+  metadata scan 和大量短 DMA。
+- 主要代价：并行度从 `B*tileCount` 降到 B；`B=1` 时只有一个 AIV 工作。
+- 目标场景：整行可驻留 UB，尤其 `K=2048,B=1/16`。
+- 核心风险：所有筛选/随机 bitmap 访问仍走 Scalar `GetValue/SetValue`。若 Scalar pipe
+  成为绝对瓶颈，单核执行时间可能抵消并行度损失；必须用 profiler 验证。
 
-在 `hit_mask` 已由上游产生且为 bool 的前提下，净减少 **`7BK` Byte（约 29.2%）**
-的相关逻辑 GM 流量，并减少约 `4*B*AlignUp(K,128)` Byte rank workspace 和 `4BK`
-Byte 输出显存。
-
-对 `B=1,K=2048`，表中相关流量由 `49,152 Byte` 降到 `34,816 Byte`，理论上减少
-`14,336 Byte`；尾 Tile 和总线事务的实际传输量以 profiler 为准。
-
-必须注意：
-
-- 把 `hit_and_miss` 改为写回 `hit` 只是改变 MTE3 目的地址，单次写出的字节量不变；
-- 真正的 MTE 降幅来自删除 `hit_rank` 读写，并以 1B bool mask 替代 4B rank 读取；
-- 若 `hit_mask` 使用 int32，相关总流量变为 `20BK`，收益降为 `4BK`；因此接口固定
-  使用 bool；
-- 若在算子调用前专门生成 mask，应把 mask 生成 Kernel 的读写和 launch 一并计入
-  端到端 benchmark。
-
-算子仍是 memory/Scalar-bound：顺序 DMA 与按 ID 随机 bitmap Scalar 访问并存，性能
-必须以目标 NPU profiler 的 MTE2/MTE3 stall、Scalar pipe 和端到端 latency 为准。
+不预先承诺固定加速比。需要比较端到端延迟、Scalar pipe、MTE stall 与 launch 开销，
+而不是只比较活跃 AIV 数。
 
 ---
 
 ## 8. 同步与并发安全
 
-- K1/K2/K3/K4 在同一 current stream 顺序发射，跨 Kernel 数据依赖由 stream 保证；
-- 同一 Kernel 内不同任务只写独占的 Tile 逻辑区间或独占 metadata 元素；
-- K1 每个 batch 行只有一个任务写，bitmap 和 count 均完整连续覆盖，不使用 atomic；
-- GM→UB 后 Scalar 首次消费使用 `MTE2_S`，Scalar→GM 前使用 `S_MTE3`，复用同一
-  UB 槽前按真实依赖使用 `MTE3_S`；禁止恢复 helper 内无条件 `PIPE_ALL`；
-- K3 必须先完成 `hit` Tile 的 MTE2 搬入和 Scalar 消费，再对相同 GM 区间执行原地
-  MTE3 写回；
-- K3 的 LRU Tile 分支不读取 `hit`，因此与 Hit Tile 分支的原地写回无数据竞争；
-- `hit` 与 `lru`/`hit_mask` 禁止存储重叠，防止跨任务读写竞争；
-- `DataCopyPad(Local -> Global)` 仅写 `blockLen` 的有效字节，尾 Tile 之间只要逻辑
-  区间不重叠，就不会因 32B 补齐而互相覆盖。
+- 不同 task 只读写不同 batch 行，无需 atomic；
+- `Duplicate(bitmapLocal)` 后 Scalar 首次访问使用 `V_S`；
+- 三个输入完成 GM→UB 后 Scalar 首次访问使用 `MTE2_S`；
+- Scalar 组装完成后，两个 GM 写出前使用 `S_MTE3`；
+- 同一 core 进入下一行并复用 UB 前使用 `MTE3_S`；
+- `hit` 必须先完整搬入 UB 再原地写回，不能边读边覆盖 GM；
+- Phase 4 完整读取原 lru 后才允许把 `lruLocal` 改写成最终 new_lru；
+- `hit` 与 `lru`/`hit_mask` 禁止存储重叠；
+- 所有 UB 子区起点按 32B 对齐，GM 尾部使用 `DataCopyPad` 的逻辑字节数。
 
 ---
 
-## 9. Host 与 Kernel 实施清单
+## 9. 实施检查清单
 
-### 9.1 Host 端
+### 9.1 Host
 
-- [ ] `ops.h` 返回类型改为 `at::Tensor`，`hit` 改为 `at::Tensor &`，新增
-      `const at::Tensor &hit_mask`；
-- [ ] dispatcher schema 改为
-      `build_lru_plan(Tensor lru, Tensor(a!) hit, Tensor hit_mask) -> Tensor new_lru`；
-- [ ] 增加 hit_mask device/dtype/rank/shape/contiguous 检查；
-- [ ] 拒绝非连续 hit，检查 hit 与只读输入不重叠；
-- [ ] 删除 `hitContiguous` 临时副本、`hitAndMiss` 和 `hitRank` 分配；
-- [ ] 删除 `hitStride` 的计算、UB 预算和 Kernel 参数；
-- [ ] K1 launch 删除 `hitRank` 参数；
-- [ ] K3 launch 新增 `hitMask`，删除 `hitRank` 和 `hitAndMiss` 参数；
-- [ ] 返回 `newLru`，不再返回 tuple。
+- [ ] 新增 row-fused UB 字节计算与 `tilingKey` 选择；
+- [ ] 快速路径不分配任何 GM workspace，只创建 `new_lru`；
+- [ ] 快速路径 `blockDim=max(1,min(B,C))`；
+- [ ] 快速路径只 launch `build_lru_plan_row` 一次；
+- [ ] 若保留 fallback，旧四 Kernel 及 workspace 仅在容量不足时启用；
+- [ ] 保持 device/dtype/shape/contiguous/overlap/overflow 检查。
 
-### 9.2 Kernel 端
+### 9.2 Kernel
 
-- [ ] K1 删除 `hitRankGm`、`rankLocal` 和 rank 写出，只统计 Tile miss count；
-- [ ] K3 增加 `GlobalTensor<uint8_t> hitMaskGm` 和 32B 对齐的 mask Tile buffer；
-- [ ] K3 Hit Tile 以 `localMissRank` 现场计算 `missBase + localMissRank`；
-- [ ] K3 把填充 Tile 同时写到 `hitGm` 与 `newLruGm`；
-- [ ] 删除所有 `hitAndMissGm` 代码；
-- [ ] 根据分支复用 K3 resident UB 区，按第 5.3 节公式重新校验 UB；
-- [ ] 保持 MTE2→S、S→MTE3、MTE3→UB 复用的窄事件依赖。
+- [ ] 新增每 task 一整行的 `build_lru_plan_row`；
+- [ ] bitmap 改为 UB 内 int16，删除 GM bitmap 和 atomic；
+- [ ] 分配 `K` hit、`K` mask、`2K` lru、`K` candidate；
+- [ ] Phase 2 只生成前 K 个 candidate；
+- [ ] Phase 3 原地修改 hitLocal，并把使用的 candidate 标入 bitmap；
+- [ ] Phase 4 复用 candidateLocal 保存 K 个 remaining；
+- [ ] 扫描结束后把 `[filled_hit, remaining]` 组装到 lruLocal；
+- [ ] hit 与 new_lru 分别只执行一次连续 MTE3；
+- [ ] 使用窄事件依赖，不引入无条件 `PIPE_ALL`。
 
 ---
 
-## 10. 测试与验收
+## 10. 测试与性能验收
 
-### 10.1 CPU Reference
-
-Reference 必须克隆调用前的 hit，并显式验证原地效果：
+### 10.1 CPU Reference 与性质测试
 
 ```python
 hit_mask = hit.ne(-1).contiguous()
-hit_before = hit.clone()
-expected_lru, expected_filled = reference(lru, hit_before, hit_mask)
-
+expected_lru, expected_hit = reference(lru, hit.clone(), hit_mask)
 actual_lru = torch.ops.npu.build_lru_plan(lru_npu, hit_npu, hit_mask_npu)
 
-assert_close(actual_lru.cpu(), expected_lru)
-assert_close(hit_npu.cpu(), expected_filled)
-assert_close(actual_lru[:, :K].cpu(), hit_npu.cpu())
-assert_equal(hit_mask_npu.cpu(), hit_mask)     # mask 不变
-assert not torch.any(hit_npu == -1)
+assert torch.equal(actual_lru.cpu(), expected_lru)
+assert torch.equal(hit_npu.cpu(), expected_hit)
+assert torch.equal(actual_lru[:, :K].cpu(), hit_npu.cpu())
+assert torch.equal(hit_mask_npu.cpu(), hit_mask)
 ```
 
-### 10.2 正确性矩阵
+CPU 模拟必须额外验证：
+
+- Phase 2 只保存前 K 个 candidate 仍覆盖所有 miss；
+- Phase 3 后 selected bitmap 恰有 K 个 1；
+- Phase 4 恰生成 K 个 remaining；
+- 最终每行仍为 `0..2K-1` 的排列。
+
+测试矩阵：
 
 | 维度 | Case |
 |---|---|
-| K | `1,3,7,8,9,47,48,49,95,96,97,127,128,129,257,2048` |
-| hit 分布 | 全 hit、全 miss、0/1 个 miss、约 50%、约 80%、miss 集中在首/尾 |
-| batch | `B=1,2,3,40,>40` |
-| Tile 边界 | hit_mask 尾 Tile 为 1B/31B/32B 附近；hit/lru 尾 Tile 为 4B/28B/32B 附近 |
-| 接口错误 | mask shape/dtype/device 错误、非连续 hit、存储重叠 |
-| 语义 | hit 原地更新、mask 保持不变、仅返回 new_lru |
-| 并发写 | 相邻 Tile 写同一 32B 中不同逻辑 byte，重复至少 10k 次 |
+| K/对齐 | `1,3,7,8,9,31,32,33,127,128,129,257,2048` |
+| hit 分布 | 全 hit、全 miss、单 miss、约 50%、约 80%、miss 集中在首/尾 |
+| batch | `B=1,2,16,40,41,80` |
+| 接口 | dtype/shape/device/非连续 hit/存储重叠 |
+| 容量 | row-fused 临界 K、刚超过临界 K 的 fallback 或报错 |
 
-生产路径不检查 mask 与 hit 的逐元素一致性；CPU 模拟测试必须增加不一致 mask 的
-debug/reference case，确保文档中的未定义行为边界明确。
+### 10.2 NPU 性能验收
 
-### 10.3 性能验收
+对 `B=1/16,K=2048` 和真实业务 shape，对比当前 tiled 四 Kernel 与 row-fused 单 Kernel：
 
-对 `B=1,K=2048` 和实际业务 batch 分别报告：
+- 端到端 p50/p90 和异步 stream 平均耗时；
+- launch 数应从 4 降为 1；
+- profiler 中不再出现中间 bitmap/candidate/count/keep GM 流量；
+- workspace 显存与 allocator 调用；
+- AIV 活跃数、Scalar pipe 占比、MTE2/MTE3 stall；
+- 全 hit、全 miss和典型 hit rate分别测量。
 
-- 端到端 p50/p90 latency 与异步 stream 平均耗时；
-- 4 次 Kernel launch 是否保持不变；
-- `hit_rank` GM 读写是否从 profiler 中消失；
-- K3 新增 bool mask MTE2 流量是否约为 `BK` Byte；
-- MTE2/MTE3 stall、Scalar pipe 占比、AIV 活跃数；
-- 包含和不包含上游 mask 生成成本的两组 benchmark。
-
-验收标准是新接口结果逐元素正确、原地 alias 语义正确，并且包含真实上游流程后的
-端到端性能不劣于旧 V2；不预先承诺仅由理论字节数推导出的固定加速百分比。
+验收标准是结果逐元素正确、原地 alias 语义正确，且目标业务 shape 的端到端性能优于
+当前实现。若 `B=1` 因 Scalar 单核瓶颈反而变慢，再评估 row-fused 与 tiled 的按规模
+dispatch，而不是直接恢复固定 48/96 元素的小 Tile。
 
 ---
 
@@ -606,10 +498,8 @@ debug/reference case，确保文档中的未定义行为边界明确。
 
 - `csrc/ops/build_lru_plan/op_host/build_lru_plan.cpp`
 - `csrc/ops/build_lru_plan/op_kernel/build_lru_plan.cpp`
-- `csrc/ops.h`
-- `csrc/register.cpp`
 - `tests/test_build_lru_plan.py`
 - `tests/benchmark_build_lru_plan.py`
 
-设计完成后使用 `ascendc-operator-code-gen` 实现接口和 Kernel，再使用
-`ascendc-operator-compile-debug` 编译、安装并在 NPU 上完成精度与 profiler 验证。
+本文件完成整行 row-fused 设计。下一步使用 `ascendc-operator-code-gen` 实现 Host/Kernel，
+再使用 `ascendc-operator-compile-debug` 编译、安装并在 NPU 上完成精度与 profiler 验证。

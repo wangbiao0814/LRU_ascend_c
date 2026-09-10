@@ -125,6 +125,111 @@ __aicore__ inline void WaitMte3ToScalar()
 
 }  // namespace
 
+// Row-fused fast path: one task owns a complete batch row.  The former K1-K4
+// stages become four scalar phases over resident K/2K UB tensors.
+extern "C" __global__ __aicore__ void build_lru_plan_row(
+    GM_ADDR lru, GM_ADDR hit, GM_ADDR hitMask, GM_ADDR newLru,
+    int64_t batchSize, int64_t k, int64_t lruLength,
+    int64_t bitmapElements, int64_t maskBytes,
+    int64_t hitElements, int64_t lruElements)
+{
+    SetAtomicNone();
+    GlobalTensor<int32_t> lruGm;
+    GlobalTensor<int32_t> hitGm;
+    GlobalTensor<uint8_t> hitMaskGm;
+    GlobalTensor<int32_t> newLruGm;
+    lruGm.SetGlobalBuffer((__gm__ int32_t *)lru,
+                          batchSize * lruLength);
+    hitGm.SetGlobalBuffer((__gm__ int32_t *)hit, batchSize * k);
+    hitMaskGm.SetGlobalBuffer((__gm__ uint8_t *)hitMask, batchSize * k);
+    newLruGm.SetGlobalBuffer((__gm__ int32_t *)newLru,
+                             batchSize * lruLength);
+
+    int64_t bitmapOffset = 0;
+    int64_t maskOffset =
+        bitmapOffset + bitmapElements * sizeof(int16_t);
+    int64_t hitOffset = maskOffset + maskBytes;
+    int64_t lruOffset = hitOffset + hitElements * sizeof(int32_t);
+    int64_t candidateOffset = lruOffset + lruElements * sizeof(int32_t);
+    int64_t workBytes = candidateOffset + hitElements * sizeof(int32_t);
+
+    TPipe pipe;
+    TBuf<TPosition::VECCALC> workBuf;
+    pipe.InitBuffer(workBuf, static_cast<uint32_t>(workBytes));
+    LocalTensor<uint8_t> work = workBuf.Get<uint8_t>();
+    LocalTensor<int16_t> bitmapLocal =
+        work[bitmapOffset].ReinterpretCast<int16_t>();
+    LocalTensor<uint8_t> maskLocal = work[maskOffset];
+    LocalTensor<int32_t> hitLocal =
+        work[hitOffset].ReinterpretCast<int32_t>();
+    LocalTensor<int32_t> lruLocal =
+        work[lruOffset].ReinterpretCast<int32_t>();
+    LocalTensor<int32_t> candidateLocal =
+        work[candidateOffset].ReinterpretCast<int32_t>();
+
+    int64_t taskCount = batchSize;
+    int64_t blockNum = GetBlockNum();
+    for (int64_t b = GetBlockIdx(); b < taskCount; b += blockNum) {
+        Duplicate(bitmapLocal, static_cast<int16_t>(0), bitmapElements);
+        CopyInInt32(hitLocal, hitGm, b * k, k);
+        CopyInUint8(maskLocal, hitMaskGm, b * k, k);
+        CopyInInt32(lruLocal, lruGm, b * lruLength, lruLength);
+        WaitMte2ToScalar();
+        WaitVectorToScalar();
+
+        // Phase 1: original hit IDs form the initial selected set.
+        for (int64_t i = 0; i < k; ++i) {
+            if (maskLocal.GetValue(i) != 0) {
+                int32_t id = hitLocal.GetValue(i);
+                bitmapLocal.SetValue(id, static_cast<int16_t>(1));
+            }
+        }
+
+        // Phase 2: retain only the first K candidates in eviction order.
+        int64_t candidateCount = 0;
+        for (int64_t p = lruLength; p > 0 && candidateCount < k; --p) {
+            int32_t id = lruLocal.GetValue(p - 1);
+            if (bitmapLocal.GetValue(id) == 0) {
+                candidateLocal.SetValue(candidateCount, id);
+                ++candidateCount;
+            }
+        }
+
+        // Phase 3: fill misses and extend the bitmap to the final selected set.
+        int64_t missRank = 0;
+        for (int64_t i = 0; i < k; ++i) {
+            if (maskLocal.GetValue(i) == 0) {
+                int32_t id = candidateLocal.GetValue(missRank);
+                ++missRank;
+                hitLocal.SetValue(i, id);
+                bitmapLocal.SetValue(id, static_cast<int16_t>(1));
+            }
+        }
+
+        // Phase 4: candidates are dead, so reuse their K-element buffer for
+        // the remaining LRU IDs in original MRU-to-LRU order.
+        int64_t keepCount = 0;
+        for (int64_t p = 0; p < lruLength; ++p) {
+            int32_t id = lruLocal.GetValue(p);
+            if (bitmapLocal.GetValue(id) == 0) {
+                candidateLocal.SetValue(keepCount, id);
+                ++keepCount;
+            }
+        }
+
+        // Assemble the complete output only after the original LRU scan ends.
+        for (int64_t i = 0; i < k; ++i) {
+            lruLocal.SetValue(i, hitLocal.GetValue(i));
+            lruLocal.SetValue(k + i, candidateLocal.GetValue(i));
+        }
+
+        WaitScalarToMte3();
+        CopyOutInt32(hitGm, b * k, hitLocal, k);
+        CopyOutInt32(newLruGm, b * lruLength, lruLocal, lruLength);
+        WaitMte3ToScalar();
+    }
+}
+
 // Stage 1: one task per row builds the complete bitmap and all tile counts.
 extern "C" __global__ __aicore__ void build_lru_plan_hit_local(
     GM_ADDR hit, GM_ADDR hitBitmap, GM_ADDR hitCounts,
