@@ -140,6 +140,10 @@ Tile 内 `hit_rank` 的生成和写出。
 初始化、整行搬出和 float atomic add。
 
 ```cpp
+Duplicate(oneLocal, 1.0f, 8);  // 初始化完整、32B 对齐的只读源块
+SetFlag<HardEvent::V_MTE3>(vToMte3);
+WaitFlag<HardEvent::V_MTE3>(vToMte3);
+
 DataCopyPad(hitLocal, hitGm[hitOffset], hitCopyParams, noPad);
 SetFlag<HardEvent::MTE2_S>(mte2ToS);
 WaitFlag<HardEvent::MTE2_S>(mte2ToS);
@@ -149,8 +153,6 @@ for (int64_t p = 0; p < validLen; ++p) {
     int32_t id = hitLocal.GetValue(p);
     if (id == -1) {
         ++missCount;
-    } else {
-        oneLocal.SetValue(p, 1.0f);
     }
 }
 countLocal.SetValue(0, missCount);
@@ -161,10 +163,15 @@ DataCopyPad(hitCountsGm[countOffset], countLocal, oneInt32Params);
 for (int64_t p = 0; p < validLen; ++p) {
     int32_t id = hitLocal.GetValue(p);
     if (id != -1) {
-        DataCopyPad(hitBitmapGm[bitmapOffset + id], oneLocal[p], oneInt32Params);
+        DataCopyPad(hitBitmapGm[bitmapOffset + id], oneLocal, oneFloatParams);
     }
 }
 ```
+
+所有稀疏短写共享同一个只读 `oneLocal`。Kernel 开始时用 `Duplicate` 将完整 32B
+源块显式初始化为 `1.0f`，并通过 `V_MTE3` event 保证初始化对 MTE3 可见。该源块
+起点必须 32B 对齐，不能使用 `oneLocal[p]`，否则 `p` 非 8 的倍数时 MTE3 的 UB
+源地址未对齐，会触发 `instruction address misalign`。
 
 普通 `DataCopyPad` 不能用一组参数表达任意 ID 的 scatter，因此这里是每个有效 ID 一次
 短写，而不是整个 Tile 一次写。若 profiler 显示短 DMA 命令开销占主导，后续备选路径是
@@ -346,11 +353,11 @@ TL = lruTileLength
 | Buffer | dtype | 数量 | 大小（Byte） | 用途 |
 |---|---|---:|---:|---|
 | `hitLocal` | int32 | 1 | `4 * TH` | hit Tile |
-| `oneLocal` | float32 | 1 | `4 * TH` | 稀疏短写的稳定源槽 |
+| `oneLocal` | float32 | 1 | `32` | 稀疏短写共享的对齐只读源块 |
 | `countLocal` | int32 | 1 | `32` | 单个 miss count 的对齐短写 |
-| **总计** | | | **`8*TH + 32`** | |
+| **总计** | | | **`4*TH + 64`** | |
 
-Tile buffer coefficient 为 **8 Byte/TH 元素**。相较整行 atomic bitmap 方案，K1 UB
+Tile buffer coefficient 为 **4 Byte/TH 元素**，另有 64B 对齐标量区。相较整行 atomic bitmap 方案，K1 UB
 不再随 `lruStride` 增长。
 
 #### K2 UB 分配
@@ -412,7 +419,7 @@ max(K1_ub_bytes, K2_ub_bytes, K3_ub_bytes, K4_ub_bytes)
 
 | Kernel | UB 使用量 |
 |---|---:|
-| K1 | `416 Byte` |
+| K1 | `256 Byte` |
 | K2 | `17,184 Byte` |
 | K3 | `17,568 Byte` |
 | K4 | `576 Byte` |

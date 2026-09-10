@@ -107,6 +107,14 @@ __aicore__ inline void WaitScalarToMte3()
     WaitFlag<HardEvent::S_MTE3>(eventId);
 }
 
+__aicore__ inline void WaitVectorToMte3()
+{
+    event_t eventId = static_cast<event_t>(
+        GetTPipePtr()->FetchEventID(HardEvent::V_MTE3));
+    SetFlag<HardEvent::V_MTE3>(eventId);
+    WaitFlag<HardEvent::V_MTE3>(eventId);
+}
+
 __aicore__ inline void WaitMte3ToScalar()
 {
     event_t eventId = static_cast<event_t>(
@@ -136,12 +144,18 @@ extern "C" __global__ __aicore__ void build_lru_plan_hit_local(
     TPipe pipe;
     TBuf<TPosition::VECCALC> workBuf;
     pipe.InitBuffer(workBuf,
-                    static_cast<uint32_t>((2 * hitTileLength +
+                    static_cast<uint32_t>((hitTileLength + 2 *
                                            kDataBlockElements) * sizeof(int32_t)));
     LocalTensor<int32_t> work = workBuf.Get<int32_t>();
     LocalTensor<int32_t> hitLocal = work;
     LocalTensor<float> oneLocal = work[hitTileLength].ReinterpretCast<float>();
-    LocalTensor<int32_t> countLocal = work[2 * hitTileLength];
+    LocalTensor<int32_t> countLocal =
+        work[hitTileLength + kDataBlockElements];
+
+    // Initialize one complete 32B data block. All sparse MTE3 stores reuse
+    // this immutable, aligned source block.
+    Duplicate(oneLocal, 1.0f, kDataBlockElements);
+    WaitVectorToMte3();
 
     int64_t taskCount = batchSize * hitTileCount;
     int64_t blockNum = GetBlockNum();
@@ -159,8 +173,6 @@ extern "C" __global__ __aicore__ void build_lru_plan_hit_local(
             int32_t id = hitLocal.GetValue(p);
             if (id == -1) {
                 ++prefix;
-            } else {
-                oneLocal.SetValue(p, 1.0f);
             }
         }
         countLocal.SetValue(0, prefix);
@@ -176,7 +188,7 @@ extern "C" __global__ __aicore__ void build_lru_plan_hit_local(
             int32_t id = hitLocal.GetValue(p);
             if (id != -1) {
                 CopyOutFloat(bitmapGm, b * lruStride + id,
-                             oneLocal[p], 1);
+                             oneLocal, 1);
             }
         }
         WaitMte3ToScalar();
