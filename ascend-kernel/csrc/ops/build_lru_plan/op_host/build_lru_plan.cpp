@@ -13,7 +13,6 @@
 #include <algorithm>
 #include <cstdint>
 #include <limits>
-#include <vector>
 
 #include <ATen/MemoryOverlap.h>
 
@@ -35,11 +34,6 @@ constexpr int64_t kMaximumSortRepeats = 255;
 int64_t AlignUp(int64_t value, int64_t alignment)
 {
     return (value + alignment - 1) / alignment * alignment;
-}
-
-int64_t AlignDown(int64_t value, int64_t alignment)
-{
-    return value / alignment * alignment;
 }
 
 int64_t NextPowerOfTwo(int64_t value)
@@ -74,7 +68,6 @@ struct UbPlan {
     int64_t sortLength;
     int64_t binarySearchSteps;
     int64_t sortTmpBytes;
-    int64_t cumSumTmpBytes;
     int64_t workBytes;
 };
 
@@ -103,17 +96,6 @@ UbPlan MakeUbPlan(int64_t k, int64_t ubSizeBytes,
             platform, static_cast<uint32_t>(sortLength), sizeof(float))),
         kUbAlignment);
 
-    std::vector<int64_t> prefixShapeDims{1, hitElements};
-    auto prefixShape = ge::Shape(prefixShapeDims);
-    uint32_t cumSumMaxRaw = 0;
-    uint32_t cumSumMinRaw = 0;
-    AscendC::GetCumSumMaxMinTmpSize(prefixShape, sizeof(float), true, false,
-                                    cumSumMaxRaw, cumSumMinRaw);
-    const int64_t cumSumMinBytes =
-        AlignUp(static_cast<int64_t>(cumSumMinRaw), kUbAlignment);
-    const int64_t cumSumMaxBytes =
-        AlignDown(static_cast<int64_t>(cumSumMaxRaw), kUbAlignment);
-
     const int64_t binaryMaskBytes =
         AlignUp((vectorLength + 7) / 8, kUbAlignment);
     // Custom int16 GatherMask patterns are padded to one 32-byte block per
@@ -130,37 +112,27 @@ UbPlan MakeUbPlan(int64_t k, int64_t ubSizeBytes,
     const int64_t sortScratchBytes = 16 * sortLength + sortTmpBytes;
     const int64_t membershipScratchBytes =
         20 * vectorLength + binaryMaskBytes + gatherPatternBytes;
-    const int64_t fillScratchWithoutCum =
-        24 * hitElements + hitMaskBytes + kUbAlignment;
+    // Integer Hillis-Steele scan: 36H bytes cover float mask creation,
+    // zero-padded int32 scan storage, shifted values, indices/offsets,
+    // gathered candidates, and the final int16 output.
+    const int64_t fillScratchBytes = 36 * hitElements + hitMaskBytes;
 
     const int64_t minimumScratchBytes = std::max(
-        {sortScratchBytes, membershipScratchBytes,
-         fillScratchWithoutCum + cumSumMinBytes});
+        {sortScratchBytes, membershipScratchBytes, fillScratchBytes});
     TORCH_CHECK(persistentBytes + minimumScratchBytes + kUbReserveBytes <=
                     ubSizeBytes,
                 "build_lru_plan: K=", k, " requires at least ",
                 persistentBytes + minimumScratchBytes,
-                " UB bytes for the vector Sort/GatherMask/CumSum path, but ",
+                " UB bytes for the vector Sort/GatherMask/prefix-scan path, but ",
                 ubSizeBytes - kUbReserveBytes,
                 " bytes remain after the safety reserve");
-
-    const int64_t cumSumCapacity = AlignDown(
-        ubSizeBytes - kUbReserveBytes - persistentBytes -
-            fillScratchWithoutCum,
-        kUbAlignment);
-    const int64_t cumSumTmpBytes = std::max(
-        cumSumMinBytes, std::min(cumSumMaxBytes, cumSumCapacity));
-    const int64_t scratchBytes = std::max(
-        {sortScratchBytes, membershipScratchBytes,
-         fillScratchWithoutCum + cumSumTmpBytes});
 
     return {hitElements,
             vectorLength,
             sortLength,
             IntegerLog2(sortLength),
             sortTmpBytes,
-            cumSumTmpBytes,
-            persistentBytes + scratchBytes};
+            persistentBytes + minimumScratchBytes};
 }
 
 }  // namespace
@@ -227,7 +199,7 @@ at::Tensor build_lru_plan(const at::Tensor &lru, at::Tensor &hit,
                     batchSize, k, lruLength, plan.hitElements,
                     plan.vectorLength, plan.sortLength,
                     plan.binarySearchSteps, plan.sortTmpBytes,
-                    plan.cumSumTmpBytes, plan.workBytes);
+                    plan.workBytes);
     return newLru;
 }
 

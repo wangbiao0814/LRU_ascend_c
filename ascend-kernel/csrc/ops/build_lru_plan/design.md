@@ -9,7 +9,7 @@
 ```text
 Sort + Gather + Compare       原 hit membership
 GatherMask                    稳定压紧非原 hit 的 LRU
-CumSum                        miss 的一维前缀 rank
+Gather + Add integer scan     miss 的一维前缀 rank
 Gather + Select               miss 候选回填
 ```
 
@@ -131,15 +131,18 @@ GatherMask(nonHitForward, lruLocal, patternU16,
 
 合法输入下 `nonHitCount=K+M`，Scalar 只读取这一个 API 元数据。
 
-### 4.4 Phase D：CumSum、Gather 与 Select 回填
+### 4.4 Phase D：整数向量扫描、Gather 与 Select 回填
 
 ```cpp
 missMask = (Cast(hitLocal) == -1.0f);
 missFlag = Select(missMask, 1.0f, 0.0f);
-prefixFloat = CumSum(missFlag);           // miss lane: 1,2,...,M
-prefixInt   = Cast<int32>(prefixFloat);   // 此后全部使用整数索引
+prefix = Cast<int32>(missFlag);
+for (shift = 1; shift < H; shift <<= 1) {
+    shifted = Gather([zeros(H), prefix], (H + arange(H) - shift) * 4);
+    prefix += shifted;
+}
 
-candidateIndex = clamp(nonHitCount - prefixInt, 0, nonHitCount - 1);
+candidateIndex = clamp(nonHitCount - prefix, 0, nonHitCount - 1);
 candidate      = Gather(F, candidateIndex * sizeof(int16_t));
 filledFloat    = Select(Cast<float>(hitLocal) != -1.0f,
                         Cast<float>(hitLocal), Cast<float>(candidate));
@@ -207,14 +210,15 @@ Membership scratch：
 = 20V + masks
 ```
 
-Fill scratch：
+Prefix/fill scratch：
 
 ```text
-24H + hitMaskBytes + cumSumTmpBytes + 32B lastRow
+36H + hitMaskBytes
 ```
 
-Host 使用 `GetSortTmpSize` 和 `GetCumSumMaxMinTmpSize` 查询高阶 API 临时空间；CumSum
-先保证 minimum，再在剩余 UB 内尽量靠近 maximum。最终：
+Host 仅使用 `GetSortTmpSize` 查询 Sort 临时空间。高阶 CumSum 在当前 CANN 对
+`[1,2048]` 返回约 256KB minimum tmp，单独就超过 192KB UB，因此改用 O(H) UB、
+O(log H) 轮的整数 Gather+Add 扫描。最终：
 
 ```text
 persistent = 2H + 4S + 4V
@@ -235,7 +239,7 @@ workBytes + 8KB <= device UB
 - 输出前用 `V_MTE3`，复用 UB 前用 `MTE3_V`；
 - Gather offset 为 uint32 字节偏移；
 - Compare 输入长度按 256B 对齐；
-- CumSum inner 的 float 字节数按 32B 对齐；
+- prefix scan 使用 int32 Gather 字节偏移，zero-prefix 区按 32B 对齐；
 - 不使用 `PIPE_ALL`，不使用业务元素 `GetValue/SetValue`。
 
 ---
@@ -243,7 +247,7 @@ workBytes + 8KB <= device UB
 ## 7. 测试与验收
 
 CPU 增加独立 `build_lru_plan_vector_model`，逐步模拟 power-of-two Sort、binary lifting、
-F、prefix rank 和 reverse-suffix Gather，并与原 reference 逐元素比较。
+F、整数 prefix rank 和 reverse-suffix Gather，并与原 reference 逐元素比较。
 
 覆盖：
 
@@ -259,5 +263,5 @@ NPU DoD：
 2. `new_lru[:,:K] == updated hit`，每行仍为 `0..2K-1` 的排列；
 3. profiler 中没有业务元素 Scalar load/store；
 4. 对目标 `K=2048` 比较旧 Scalar row-fused 与新 vector path 的 p50/p90、Vector/Scalar
-   pipe、Sort/GatherMask/CumSum 周期和 UB occupancy；
+   pipe、Sort/GatherMask/prefix-scan 周期和 UB occupancy；
 5. 只有实测收益后才决定是否需要 small-K dispatch。

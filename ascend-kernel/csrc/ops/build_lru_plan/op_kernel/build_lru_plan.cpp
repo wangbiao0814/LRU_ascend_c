@@ -16,8 +16,6 @@ using namespace AscendC;
 
 namespace {
 
-constexpr CumSumConfig kCumSumConfig{true, false, false};
-
 __aicore__ inline void CopyInInt16(LocalTensor<int16_t> dst,
                                    GlobalTensor<int16_t> &src,
                                    int64_t srcOffset, int64_t length)
@@ -66,7 +64,7 @@ extern "C" __global__ __aicore__ void build_lru_plan_row(
     int64_t batchSize, int64_t k, int64_t lruLength,
     int64_t hitElements, int64_t vectorLength, int64_t sortLength,
     int64_t binarySearchSteps, int64_t sortTmpBytes,
-    int64_t cumSumTmpBytes, int64_t workBytes)
+    int64_t workBytes)
 {
     SetAtomicNone();
     (void)hitMask;
@@ -210,30 +208,29 @@ extern "C" __global__ __aicore__ void build_lru_plan_row(
         PipeBarrier<HardEvent::V_S>();
         const int32_t nonHitCountInt = static_cast<int32_t>(nonHitCount);
 
-        // Phase C: CumSum creates one-based miss ranks. F[nonHitCount-prefix]
-        // is the reverse-suffix eviction candidate for each miss position.
+        // Phase C: build one-based miss ranks. The high-level CumSum API needs
+        // a 256-KB minimum temporary buffer on the target CANN version, so use
+        // an integer Hillis-Steele scan implemented by Gather + Add instead.
         LocalTensor<float> hitFloat = scratch.ReinterpretCast<float>();
         LocalTensor<float> oneOrMinusOne =
             ByteSlice(scratch, hitElements * 4).ReinterpretCast<float>();
-        LocalTensor<float> missFlag =
+        LocalTensor<float> missFlagFloat =
             ByteSlice(scratch, hitElements * 8).ReinterpretCast<float>();
-        LocalTensor<float> prefixOrIndex =
-            ByteSlice(scratch, hitElements * 12).ReinterpretCast<float>();
+        LocalTensor<int32_t> scanStorage =
+            ByteSlice(scratch, hitElements * 12).ReinterpretCast<int32_t>();
+        LocalTensor<int32_t> scanPrefix = scanStorage[hitElements];
+        LocalTensor<int32_t> shiftedPrefix =
+            ByteSlice(scratch, hitElements * 20).ReinterpretCast<int32_t>();
+        LocalTensor<int32_t> scanIndex =
+            ByteSlice(scratch, hitElements * 24).ReinterpretCast<int32_t>();
         LocalTensor<int32_t> missByteOffset =
-            ByteSlice(scratch, hitElements * 16).ReinterpretCast<int32_t>();
+            ByteSlice(scratch, hitElements * 28).ReinterpretCast<int32_t>();
         LocalTensor<int16_t> candidateForPos =
-            ByteSlice(scratch, hitElements * 20).ReinterpretCast<int16_t>();
+            ByteSlice(scratch, hitElements * 32).ReinterpretCast<int16_t>();
         LocalTensor<int16_t> filledHit =
-            ByteSlice(scratch, hitElements * 22).ReinterpretCast<int16_t>();
-        const int64_t fillMaskOffset = hitElements * 24;
-        const int64_t fillMaskBytes = ((hitElements + 255) / 256) * 32;
+            ByteSlice(scratch, hitElements * 34).ReinterpretCast<int16_t>();
+        const int64_t fillMaskOffset = hitElements * 36;
         LocalTensor<uint8_t> missMask = ByteSlice(scratch, fillMaskOffset);
-        LocalTensor<uint8_t> cumSumTmp =
-            ByteSlice(scratch, fillMaskOffset + fillMaskBytes);
-        LocalTensor<float> lastRow =
-            ByteSlice(scratch, fillMaskOffset + fillMaskBytes +
-                                   cumSumTmpBytes)
-                .ReinterpretCast<float>();
 
         Cast(hitFloat, hitLocal, RoundMode::CAST_NONE,
              static_cast<uint32_t>(hitElements));
@@ -242,19 +239,30 @@ extern "C" __global__ __aicore__ void build_lru_plan_row(
                 static_cast<uint32_t>(hitElements));
         Duplicate(hitFloat, 0.0f, hitElements);
         Duplicate(oneOrMinusOne, 1.0f, hitElements);
-        Select(missFlag, missMask, oneOrMinusOne, hitFloat,
+        Select(missFlagFloat, missMask, oneOrMinusOne, hitFloat,
                SELMODE::VSEL_TENSOR_TENSOR_MODE,
                static_cast<uint32_t>(hitElements));
 
-        CumSumInfo cumSumInfo{1, static_cast<uint32_t>(hitElements)};
-        CumSum<float, kCumSumConfig>(prefixOrIndex, lastRow, missFlag,
-                                     cumSumTmp, cumSumInfo);
-        PipeBarrier<HardEvent::S_V>();
-        // CumSum is float-only on A2/A3. Convert its exact integer-valued
-        // result once, then keep rank/index/offset arithmetic entirely int32.
-        Cast(missByteOffset, prefixOrIndex, RoundMode::CAST_RINT,
+        Duplicate(scanStorage, static_cast<int32_t>(0), 2 * hitElements);
+        Cast(scanPrefix, missFlagFloat, RoundMode::CAST_RINT,
              static_cast<uint32_t>(hitElements));
-        Muls(missByteOffset, missByteOffset, static_cast<int32_t>(-1),
+        CreateVecIndex(scanIndex, static_cast<int32_t>(0),
+                       static_cast<uint32_t>(hitElements));
+        for (int32_t shift = 1; shift < hitElements; shift <<= 1) {
+            // scanStorage[0:H] is fixed zero padding; [H:2H] is the
+            // current prefix. H+i-shift therefore yields zero for i<shift.
+            Adds(missByteOffset, scanIndex,
+                 static_cast<int32_t>(hitElements) - shift, hitElements);
+            Muls(missByteOffset, missByteOffset,
+                 static_cast<int32_t>(sizeof(int32_t)), hitElements);
+            Gather(shiftedPrefix, scanStorage,
+                   missByteOffset.ReinterpretCast<uint32_t>(), 0,
+                   static_cast<uint32_t>(hitElements));
+            Add(scanPrefix, scanPrefix, shiftedPrefix, hitElements);
+        }
+
+        PipeBarrier<HardEvent::S_V>();
+        Muls(missByteOffset, scanPrefix, static_cast<int32_t>(-1),
              hitElements);
         Adds(missByteOffset, missByteOffset,
              nonHitCountInt, hitElements);
@@ -272,15 +280,16 @@ extern "C" __global__ __aicore__ void build_lru_plan_row(
         // conversion is exact; cast the selected values back to int16.
         Cast(hitFloat, hitLocal, RoundMode::CAST_NONE,
              static_cast<uint32_t>(hitElements));
-        Duplicate(prefixOrIndex, -1.0f, hitElements);
-        Compare(missMask, hitFloat, prefixOrIndex, CMPMODE::NE,
+        Duplicate(scanStorage.ReinterpretCast<float>(), -1.0f, hitElements);
+        Compare(missMask, hitFloat, scanStorage.ReinterpretCast<float>(),
+                CMPMODE::NE,
                 static_cast<uint32_t>(hitElements));
         Cast(oneOrMinusOne, candidateForPos, RoundMode::CAST_NONE,
              static_cast<uint32_t>(hitElements));
-        Select(missFlag, missMask, hitFloat, oneOrMinusOne,
+        Select(missFlagFloat, missMask, hitFloat, oneOrMinusOne,
                SELMODE::VSEL_TENSOR_TENSOR_MODE,
                static_cast<uint32_t>(hitElements));
-        Cast(filledHit, missFlag, RoundMode::CAST_RINT,
+        Cast(filledHit, missFlagFloat, RoundMode::CAST_RINT,
              static_cast<uint32_t>(hitElements));
 
         PipeBarrier<HardEvent::V_MTE3>();
