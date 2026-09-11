@@ -146,12 +146,13 @@ extern "C" __global__ __aicore__ void build_lru_plan_row(
         // Phase B: vector-parallel descending lower_bound. base is the last
         // sorted position whose value is greater than the current LRU ID.
         LocalTensor<float> query = scratch.ReinterpretCast<float>();
-        LocalTensor<int32_t> base =
-            ByteSlice(scratch, vectorLength * 4)
-                .ReinterpretCast<int32_t>();
-        LocalTensor<int32_t> candidate =
-            ByteSlice(scratch, vectorLength * 8)
-                .ReinterpretCast<int32_t>();
+        // A2/A3 vsel accepts half/float data tensors, not int32. Keep the
+        // binary-search state in exact float integers and cast only the
+        // Gather byte offsets to int32.
+        LocalTensor<float> base =
+            ByteSlice(scratch, vectorLength * 4).ReinterpretCast<float>();
+        LocalTensor<float> candidate =
+            ByteSlice(scratch, vectorLength * 8).ReinterpretCast<float>();
         LocalTensor<int32_t> byteOffset =
             ByteSlice(scratch, vectorLength * 12)
                 .ReinterpretCast<int32_t>();
@@ -165,12 +166,14 @@ extern "C" __global__ __aicore__ void build_lru_plan_row(
 
         Cast(query, lruLocal, RoundMode::CAST_NONE,
              static_cast<uint32_t>(vectorLength));
-        Duplicate(base, static_cast<int32_t>(-1), vectorLength);
+        Duplicate(base, -1.0f, vectorLength);
         int32_t step = static_cast<int32_t>(sortLength >> 1);
         for (int64_t round = 0; round < binarySearchSteps;
              ++round, step >>= 1) {
-            Adds(candidate, base, step, vectorLength);
-            Muls(byteOffset, candidate,
+            Adds(candidate, base, static_cast<float>(step), vectorLength);
+            Cast(byteOffset, candidate, RoundMode::CAST_RINT,
+                 static_cast<uint32_t>(vectorLength));
+            Muls(byteOffset, byteOffset,
                  static_cast<int32_t>(sizeof(float)), vectorLength);
             Gather(probe, sortedHit,
                    byteOffset.ReinterpretCast<uint32_t>(), 0,
@@ -181,8 +184,10 @@ extern "C" __global__ __aicore__ void build_lru_plan_row(
                    SELMODE::VSEL_TENSOR_TENSOR_MODE,
                    static_cast<uint32_t>(vectorLength));
         }
-        Adds(candidate, base, static_cast<int32_t>(1), vectorLength);
-        Muls(byteOffset, candidate, static_cast<int32_t>(sizeof(float)),
+        Adds(candidate, base, 1.0f, vectorLength);
+        Cast(byteOffset, candidate, RoundMode::CAST_RINT,
+             static_cast<uint32_t>(vectorLength));
+        Muls(byteOffset, byteOffset, static_cast<int32_t>(sizeof(float)),
              vectorLength);
         Gather(probe, sortedHit, byteOffset.ReinterpretCast<uint32_t>(), 0,
                static_cast<uint32_t>(vectorLength));
@@ -263,12 +268,20 @@ extern "C" __global__ __aicore__ void build_lru_plan_row(
                missByteOffset.ReinterpretCast<uint32_t>(), 0,
                static_cast<uint32_t>(hitElements));
 
-        Duplicate(filledHit, static_cast<int16_t>(-1), hitElements);
-        Compare(missMask, hitLocal, filledHit, CMPMODE::NE,
+        // The final vsel also uses float on A2/A3. IDs are <= 32767, so the
+        // conversion is exact; cast the selected values back to int16.
+        Cast(hitFloat, hitLocal, RoundMode::CAST_NONE,
+             static_cast<uint32_t>(hitElements));
+        Duplicate(prefixOrIndex, -1.0f, hitElements);
+        Compare(missMask, hitFloat, prefixOrIndex, CMPMODE::NE,
                 static_cast<uint32_t>(hitElements));
-        Select(filledHit, missMask, hitLocal, candidateForPos,
+        Cast(oneOrMinusOne, candidateForPos, RoundMode::CAST_NONE,
+             static_cast<uint32_t>(hitElements));
+        Select(missFlag, missMask, hitFloat, oneOrMinusOne,
                SELMODE::VSEL_TENSOR_TENSOR_MODE,
                static_cast<uint32_t>(hitElements));
+        Cast(filledHit, missFlag, RoundMode::CAST_RINT,
+             static_cast<uint32_t>(hitElements));
 
         PipeBarrier<HardEvent::V_MTE3>();
         CopyOutInt16(hitGm, b * k, filledHit, k);

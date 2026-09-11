@@ -100,13 +100,14 @@ miss 与 padding 均为 `-1.0f`。合法 LRU ID 非负，因此重复 sentinel �
 对降序数组用 binary lifting 查找第一个 `<=query` 的位置：
 
 ```cpp
-base = -1;
+baseFloat = -1.0f;
 for (step = sortLength/2; step > 0; step >>= 1) {
-    candidate = base + step;
-    probe = Gather(sortedHit, candidate * sizeof(float));
-    base = Select(probe > query, candidate, base);
+    candidateFloat = baseFloat + float(step);
+    candidateOffset = Cast<int32>(candidateFloat) * sizeof(float);
+    probe = Gather(sortedHit, candidateOffset);
+    baseFloat = Select(probe > query, candidateFloat, baseFloat);
 }
-probe = Gather(sortedHit, (base + 1) * sizeof(float));
+probe = Gather(sortedHit, Cast<int32>(baseFloat + 1.0f) * sizeof(float));
 notFound = (probe != query);
 ```
 
@@ -140,8 +141,13 @@ prefixInt   = Cast<int32>(prefixFloat);   // 此后全部使用整数索引
 
 candidateIndex = clamp(nonHitCount - prefixInt, 0, nonHitCount - 1);
 candidate      = Gather(F, candidateIndex * sizeof(int16_t));
-filledHit      = Select(hitLocal != -1, hitLocal, candidate);
+filledFloat    = Select(Cast<float>(hitLocal) != -1.0f,
+                        Cast<float>(hitLocal), Cast<float>(candidate));
+filledHit      = Cast<int16>(filledFloat);
 ```
+
+A2/A3 的基础 Select 数据 Tensor 仅支持 half/float。因此二分状态和最终选择在 float32
+中完成；ID 与索引上限小于 32768，float32 可精确表示，Gather offset 与 rank 仍为 int32。
 
 hit lane 的 candidate 无业务语义，但 index 仍钳到合法范围，避免 speculative 越界。
 全 hit 时 `nonHitCount=K`、prefix 全 0，钳位后访问 `F[K-1]`，最终 Select 保留原 hit，
