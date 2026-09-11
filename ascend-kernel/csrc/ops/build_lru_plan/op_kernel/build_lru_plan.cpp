@@ -203,6 +203,7 @@ extern "C" __global__ __aicore__ void build_lru_plan_row(
                    gatherPattern.ReinterpretCast<uint16_t>(), false, 0,
                    gatherParams, nonHitCount);
         PipeBarrier<HardEvent::V_S>();
+        const int32_t nonHitCountInt = static_cast<int32_t>(nonHitCount);
 
         // Phase C: CumSum creates one-based miss ranks. F[nonHitCount-prefix]
         // is the reverse-suffix eviction candidate for each miss position.
@@ -244,14 +245,18 @@ extern "C" __global__ __aicore__ void build_lru_plan_row(
         CumSum<float, kCumSumConfig>(prefixOrIndex, lastRow, missFlag,
                                      cumSumTmp, cumSumInfo);
         PipeBarrier<HardEvent::S_V>();
-        Muls(prefixOrIndex, prefixOrIndex, -1.0f, hitElements);
-        Adds(prefixOrIndex, prefixOrIndex,
-             static_cast<float>(nonHitCount), hitElements);
-        Mins(prefixOrIndex, prefixOrIndex,
-             static_cast<float>(nonHitCount - 1), hitElements);
-        Maxs(prefixOrIndex, prefixOrIndex, 0.0f, hitElements);
+        // CumSum is float-only on A2/A3. Convert its exact integer-valued
+        // result once, then keep rank/index/offset arithmetic entirely int32.
         Cast(missByteOffset, prefixOrIndex, RoundMode::CAST_RINT,
              static_cast<uint32_t>(hitElements));
+        Muls(missByteOffset, missByteOffset, static_cast<int32_t>(-1),
+             hitElements);
+        Adds(missByteOffset, missByteOffset,
+             nonHitCountInt, hitElements);
+        Mins(missByteOffset, missByteOffset,
+             nonHitCountInt - 1, hitElements);
+        Maxs(missByteOffset, missByteOffset, static_cast<int32_t>(0),
+             hitElements);
         Muls(missByteOffset, missByteOffset,
              static_cast<int32_t>(sizeof(int16_t)), hitElements);
         Gather(candidateForPos, nonHitForward,

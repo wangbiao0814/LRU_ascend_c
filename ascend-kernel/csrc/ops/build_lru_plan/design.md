@@ -135,9 +135,10 @@ GatherMask(nonHitForward, lruLocal, patternU16,
 ```cpp
 missMask = (Cast(hitLocal) == -1.0f);
 missFlag = Select(missMask, 1.0f, 0.0f);
-prefix   = CumSum(missFlag);              // miss lane: 1,2,...,M
+prefixFloat = CumSum(missFlag);           // miss lane: 1,2,...,M
+prefixInt   = Cast<int32>(prefixFloat);   // 此后全部使用整数索引
 
-candidateIndex = clamp(nonHitCount - prefix, 0, nonHitCount - 1);
+candidateIndex = clamp(nonHitCount - prefixInt, 0, nonHitCount - 1);
 candidate      = Gather(F, candidateIndex * sizeof(int16_t));
 filledHit      = Select(hitLocal != -1, hitLocal, candidate);
 ```
