@@ -13,25 +13,52 @@
 #include <algorithm>
 #include <cstdint>
 #include <limits>
+#include <vector>
 
 #include <ATen/MemoryOverlap.h>
 
 #include "torch_kernel_helper.h"
 #include "tiling/platform/platform_ascendc.h"
+#include "tiling/tiling_api.h"
 
 #include "aclrtlaunch_build_lru_plan_row.h"
 
 namespace ascend_kernel {
 namespace {
 
-constexpr int64_t kInt16PerDataBlock = 16;
+constexpr int64_t kUbAlignment = 32;
 constexpr int64_t kUbReserveBytes = 8 * 1024;
 constexpr int64_t kMaximumK =
     (static_cast<int64_t>(std::numeric_limits<int16_t>::max()) + 1) / 2;
+constexpr int64_t kMaximumSortRepeats = 255;
 
 int64_t AlignUp(int64_t value, int64_t alignment)
 {
     return (value + alignment - 1) / alignment * alignment;
+}
+
+int64_t AlignDown(int64_t value, int64_t alignment)
+{
+    return value / alignment * alignment;
+}
+
+int64_t NextPowerOfTwo(int64_t value)
+{
+    int64_t result = 1;
+    while (result < value) {
+        result <<= 1;
+    }
+    return result;
+}
+
+int64_t IntegerLog2(int64_t powerOfTwo)
+{
+    int64_t result = 0;
+    while (powerOfTwo > 1) {
+        powerOfTwo >>= 1;
+        ++result;
+    }
+    return result;
 }
 
 uint32_t MakeBlockDim(int64_t batchSize, int64_t coreNum)
@@ -41,12 +68,99 @@ uint32_t MakeBlockDim(int64_t batchSize, int64_t coreNum)
     return static_cast<uint32_t>(usedCoreNum);
 }
 
-int64_t FusedKernelUbBytes(int64_t bitmapElements, int64_t maskBytes,
-                           int64_t hitElements, int64_t lruElements)
+struct UbPlan {
+    int64_t hitElements;
+    int64_t vectorLength;
+    int64_t sortLength;
+    int64_t binarySearchSteps;
+    int64_t sortTmpBytes;
+    int64_t cumSumTmpBytes;
+    int64_t workBytes;
+};
+
+UbPlan MakeUbPlan(int64_t k, int64_t ubSizeBytes,
+                  const platform_ascendc::PlatformAscendC &platform)
 {
-    return bitmapElements * static_cast<int64_t>(sizeof(int16_t)) + maskBytes +
-           2 * hitElements * static_cast<int64_t>(sizeof(int16_t)) +
-           lruElements * static_cast<int64_t>(sizeof(int16_t));
+    // int16 Compare/GatherMask process 128 elements per 256-byte repeat.
+    const int64_t hitElements = AlignUp(k, 128);
+    const int64_t vectorLength = AlignUp(2 * k, 128);
+    // A power-of-two sort extent enables branch-free binary lifting. A
+    // minimum of 32 is required by Sort.
+    const int64_t sortLength =
+        std::max<int64_t>(32, NextPowerOfTwo(k + 1));
+    const int64_t sortRepeats = sortLength / 32;
+    TORCH_CHECK(sortRepeats <= kMaximumSortRepeats,
+                "build_lru_plan: vector Sort requires at most ",
+                kMaximumSortRepeats, " repeats, got ", sortRepeats,
+                " for K=", k);
+    TORCH_CHECK(vectorLength / 128 <= kMaximumSortRepeats,
+                "build_lru_plan: vector GatherMask requires at most ",
+                kMaximumSortRepeats, " repeats, got ", vectorLength / 128,
+                " for K=", k);
+
+    const int64_t sortTmpBytes = AlignUp(
+        static_cast<int64_t>(AscendC::GetSortTmpSize(
+            platform, static_cast<uint32_t>(sortLength), sizeof(float))),
+        kUbAlignment);
+
+    std::vector<int64_t> prefixShapeDims{1, hitElements};
+    auto prefixShape = ge::Shape(prefixShapeDims);
+    uint32_t cumSumMaxRaw = 0;
+    uint32_t cumSumMinRaw = 0;
+    AscendC::GetCumSumMaxMinTmpSize(prefixShape, sizeof(float), true, false,
+                                    cumSumMaxRaw, cumSumMinRaw);
+    const int64_t cumSumMinBytes =
+        AlignUp(static_cast<int64_t>(cumSumMinRaw), kUbAlignment);
+    const int64_t cumSumMaxBytes =
+        AlignDown(static_cast<int64_t>(cumSumMaxRaw), kUbAlignment);
+
+    const int64_t binaryMaskBytes =
+        AlignUp((vectorLength + 7) / 8, kUbAlignment);
+    // Custom int16 GatherMask patterns are padded to one 32-byte block per
+    // 128 source elements so src1RepeatStride remains an integer block.
+    const int64_t gatherPatternBytes = vectorLength / 128 * kUbAlignment;
+    const int64_t hitMaskBytes =
+        AlignUp((hitElements + 7) / 8, kUbAlignment);
+
+    const int64_t persistentBytes =
+        hitElements * static_cast<int64_t>(sizeof(int16_t)) +
+        sortLength * static_cast<int64_t>(sizeof(float)) +
+        vectorLength * static_cast<int64_t>(sizeof(int16_t)) +
+        vectorLength * static_cast<int64_t>(sizeof(int16_t));
+    const int64_t sortScratchBytes = 16 * sortLength + sortTmpBytes;
+    const int64_t membershipScratchBytes =
+        20 * vectorLength + binaryMaskBytes + gatherPatternBytes;
+    const int64_t fillScratchWithoutCum =
+        24 * hitElements + hitMaskBytes + kUbAlignment;
+
+    const int64_t minimumScratchBytes = std::max(
+        {sortScratchBytes, membershipScratchBytes,
+         fillScratchWithoutCum + cumSumMinBytes});
+    TORCH_CHECK(persistentBytes + minimumScratchBytes + kUbReserveBytes <=
+                    ubSizeBytes,
+                "build_lru_plan: K=", k, " requires at least ",
+                persistentBytes + minimumScratchBytes,
+                " UB bytes for the vector Sort/GatherMask/CumSum path, but ",
+                ubSizeBytes - kUbReserveBytes,
+                " bytes remain after the safety reserve");
+
+    const int64_t cumSumCapacity = AlignDown(
+        ubSizeBytes - kUbReserveBytes - persistentBytes -
+            fillScratchWithoutCum,
+        kUbAlignment);
+    const int64_t cumSumTmpBytes = std::max(
+        cumSumMinBytes, std::min(cumSumMaxBytes, cumSumCapacity));
+    const int64_t scratchBytes = std::max(
+        {sortScratchBytes, membershipScratchBytes,
+         fillScratchWithoutCum + cumSumTmpBytes});
+
+    return {hitElements,
+            vectorLength,
+            sortLength,
+            IntegerLog2(sortLength),
+            sortTmpBytes,
+            cumSumTmpBytes,
+            persistentBytes + scratchBytes};
 }
 
 }  // namespace
@@ -83,44 +197,37 @@ at::Tensor build_lru_plan(const at::Tensor &lru, at::Tensor &hit,
     TORCH_CHECK(at::get_overlap_status(hit, hitMask) == at::MemOverlapStatus::No,
                 "build_lru_plan: hit must not overlap hit_mask storage");
 
-    int64_t batchSize = hit.size(0);
-    int64_t k = hit.size(1);
+    const int64_t batchSize = hit.size(0);
+    const int64_t k = hit.size(1);
     TORCH_CHECK(k <= kMaximumK,
                 "build_lru_plan: int16 IDs require K <= ", kMaximumK,
                 ", got ", k);
-    int64_t lruLength = 2 * k;
+    const int64_t lruLength = 2 * k;
     TORCH_CHECK(lru.size(1) == lruLength,
                 "build_lru_plan: lru.shape[1] must equal 2 * hit.shape[1]");
 
     at::Tensor lruContiguous = lru.contiguous();
-    at::Tensor hitMaskContiguous = hitMask.contiguous();
     at::Tensor newLru = at::empty_like(lruContiguous);
 
     auto ascendcPlatform = platform_ascendc::PlatformAscendCManager::GetInstance();
-    int64_t coreNum = static_cast<int64_t>(ascendcPlatform->GetCoreNumAiv());
+    const int64_t coreNum =
+        static_cast<int64_t>(ascendcPlatform->GetCoreNumAiv());
     uint64_t ubSizeRaw = 0;
-    ascendcPlatform->GetCoreMemSize(platform_ascendc::CoreMemType::UB, ubSizeRaw);
-    int64_t ubSizeBytes = static_cast<int64_t>(ubSizeRaw);
+    ascendcPlatform->GetCoreMemSize(platform_ascendc::CoreMemType::UB,
+                                    ubSizeRaw);
+    const int64_t ubSizeBytes = static_cast<int64_t>(ubSizeRaw);
     TORCH_CHECK(coreNum > 0, "build_lru_plan: platform reports no AIV cores");
     TORCH_CHECK(ubSizeBytes > kUbReserveBytes,
                 "build_lru_plan: platform UB is smaller than the safety reserve");
 
-    int64_t bitmapElements = AlignUp(lruLength, kInt16PerDataBlock);
-    int64_t maskBytes = AlignUp(k, 32);
-    int64_t hitElements = AlignUp(k, kInt16PerDataBlock);
-    int64_t lruElements = AlignUp(lruLength, kInt16PerDataBlock);
-    int64_t fusedUbBytes = FusedKernelUbBytes(
-        bitmapElements, maskBytes, hitElements, lruElements);
-    TORCH_CHECK(fusedUbBytes + kUbReserveBytes <= ubSizeBytes,
-                "build_lru_plan: K=", k, " requires ", fusedUbBytes,
-                " UB bytes for the int16 row-fused path, but only ",
-                ubSizeBytes - kUbReserveBytes, " bytes are available");
-
-    uint32_t rowBlockDim = MakeBlockDim(batchSize, coreNum);
+    const UbPlan plan = MakeUbPlan(k, ubSizeBytes, *ascendcPlatform);
+    const uint32_t rowBlockDim = MakeBlockDim(batchSize, coreNum);
     EXEC_KERNEL_CMD(build_lru_plan_row, rowBlockDim,
-                    lruContiguous, hit, hitMaskContiguous, newLru,
-                    batchSize, k, lruLength, bitmapElements, maskBytes,
-                    hitElements, lruElements);
+                    lruContiguous, hit, hitMask, newLru,
+                    batchSize, k, lruLength, plan.hitElements,
+                    plan.vectorLength, plan.sortLength,
+                    plan.binarySearchSteps, plan.sortTmpBytes,
+                    plan.cumSumTmpBytes, plan.workBytes);
     return newLru;
 }
 

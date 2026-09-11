@@ -337,6 +337,55 @@ def build_lru_plan_row_fused(lru, hit, hit_mask):
     )
 
 
+def build_lru_plan_vector_model(lru, hit):
+    """CPU model of Sort + vector lower_bound + compact + CumSum/Gather."""
+    _, k = hit.shape
+    output_lru = []
+    output_hit = []
+
+    sort_length = 32
+    while sort_length < k + 1:
+        sort_length *= 2
+
+    for lru_tensor, hit_tensor in zip(lru, hit):
+        lru_row = lru_tensor.tolist()
+        hit_row = hit_tensor.tolist()
+        sorted_hit = sorted(
+            hit_row + [-1] * (sort_length - k), reverse=True
+        )
+
+        found = []
+        for query in lru_row:
+            base = -1
+            step = sort_length // 2
+            while step:
+                candidate = base + step
+                if sorted_hit[candidate] > query:
+                    base = candidate
+                step //= 2
+            found.append(sorted_hit[base + 1] == query)
+
+        non_hit_forward = [
+            value for value, is_found in zip(lru_row, found) if not is_found
+        ]
+        prefix = 0
+        filled = []
+        for value in hit_row:
+            if value != -1:
+                filled.append(value)
+                continue
+            prefix += 1
+            filled.append(non_hit_forward[len(non_hit_forward) - prefix])
+
+        output_hit.append(filled)
+        output_lru.append(filled + non_hit_forward[:k])
+
+    return (
+        torch.tensor(output_lru, dtype=torch.int16),
+        torch.tensor(output_hit, dtype=torch.int16),
+    )
+
+
 @pytest.mark.parametrize("k", [1, 3, 127, 128, 129, 257])
 @pytest.mark.parametrize("tile_length", [128, 256])
 def test_staged_algorithm_matches_reference(k, tile_length):
@@ -379,6 +428,29 @@ def test_row_fused_algorithm_miss_extremes(all_miss, no_miss):
     hit_mask = hit.ne(-1)
     expected = build_lru_plan_reference(lru, hit, hit_mask)
     actual = build_lru_plan_row_fused(lru, hit, hit_mask)
+    torch.testing.assert_close(actual[0], expected[0], rtol=0, atol=0)
+    torch.testing.assert_close(actual[1], expected[1], rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("batch_size", [1, 3, 41])
+@pytest.mark.parametrize(
+    "k", [1, 3, 7, 8, 9, 31, 32, 33, 127, 128, 129, 257, 512, 2048]
+)
+def test_vector_algorithm_matches_reference(batch_size, k):
+    lru, hit = make_inputs(batch_size, k, seed=98304 + batch_size + k)
+    expected = build_lru_plan_reference(lru, hit, hit.ne(-1))
+    actual = build_lru_plan_vector_model(lru, hit)
+    torch.testing.assert_close(actual[0], expected[0], rtol=0, atol=0)
+    torch.testing.assert_close(actual[1], expected[1], rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("all_miss,no_miss", [(True, False), (False, True)])
+def test_vector_algorithm_miss_extremes(all_miss, no_miss):
+    lru, hit = make_inputs(
+        3, 129, seed=131072, all_miss=all_miss, no_miss=no_miss
+    )
+    expected = build_lru_plan_reference(lru, hit, hit.ne(-1))
+    actual = build_lru_plan_vector_model(lru, hit)
     torch.testing.assert_close(actual[0], expected[0], rtol=0, atol=0)
     torch.testing.assert_close(actual[1], expected[1], rtol=0, atol=0)
 
